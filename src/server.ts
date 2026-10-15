@@ -401,9 +401,12 @@ export default Plugin.define({
         switch (input.action) {
           case "status":
           case "pricing":
+            // Report the whole instance's view, not one location's memory.
+            await engine.refresh();
             return { status: engine.status() as unknown as Record<string, unknown> };
           case "on":
             engine.setEnabled(true);
+            await engine.refresh();
             return { message: `opencode-free-first is ON. ${engine.statusLine()}` };
           case "off":
             engine.setEnabled(false);

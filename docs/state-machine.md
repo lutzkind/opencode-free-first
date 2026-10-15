@@ -86,10 +86,15 @@ Used only when no reset metadata exists:
   before the interruption so a repeated tick cannot reclaim the same request
   twice.
 - **Across instances.** OpenCode loads one plugin instance per location, and every
-  instance shares this plugin's storage. Before recording a limit or issuing a
-  probe, an instance adopts the persisted record when it is more conservative
-  (longer cooldown, higher ladder position), so a limit discovered in one location
-  is shared rather than rediscovered per location.
+  instance shares this plugin's storage. Before prompt admission, before a
+  fallback-model prepare, before applying routing, before recording a limit, and
+  before issuing a probe, an instance re-reads the persisted record and adopts
+  whatever is more conservative — the longer cooldown, the higher ladder position,
+  or a recovery confirmed elsewhere. A limit discovered in one location is
+  therefore shared rather than rediscovered per location, and a stale local
+  cooldown cannot outlive a recovery that another instance already confirmed.
+  `status` re-reads shared health before reporting, so diagnostics never show a
+  healthy free model while a shared cooldown is active.
 
 ## Persistence
 

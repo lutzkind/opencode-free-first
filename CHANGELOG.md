@@ -3,6 +3,19 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-10-15
+
+### Fixed
+
+- `status` now reflects the whole OpenCode instance. It re-reads shared health
+  before reporting, so a cooldown recorded in another location is never reported
+  as a healthy free model.
+
+### Added
+
+- A recovery confirmed by another instance is adopted as authoritative, so a
+  stale local cooldown cannot outlive the recovery that cleared it.
+
 ## [0.1.2] — 2026-10-15
 
 ### Fixed
@@ -79,6 +92,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.3]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.3
 [0.1.2]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.2
 [0.1.1]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.0

@@ -479,6 +479,34 @@ describe("persistence and restart", () => {
     assert.equal(sessions.of("switchModel").length, 0);
   });
 
+  it("adopts a recovery confirmed by another instance", async () => {
+    const storage = new FakeStorage();
+    const { engine, clock, sessions } = await boot({ storage, config: { probe: false } });
+    await engine.onRetry({
+      sessionID: "ses_a",
+      model: FREE,
+      error: rateLimitError(),
+      attempt: 2,
+      decision: { retry: false },
+    });
+    assert.equal(engine.status().state, "FREE_COOLDOWN");
+    await storage.set("opencode-free-first/health-v1", {
+      schemaVersion: 1,
+      scope: "fake/fake-free",
+      state: "FREE_HEALTHY",
+      level: 0,
+      lastHealthyAt: clock.now() + 1,
+      lastRateLimitAt: 1,
+    });
+    await engine.refresh();
+    assert.equal(engine.status().state, "FREE_HEALTHY", "the stale local cooldown was cleared");
+    // The session converges at its next boundary, as it always does.
+    await engine.onPrompt("ses_a");
+    assert.equal(sessions.of("switchModel").length, 2, "the session returned to free");
+    assert.equal(engine.status().fallbackSessions, 0);
+    await clock.advance(2_000);
+  });
+
   it("does not probe while another instance holds a live cooldown", async () => {
     const storage = new FakeStorage({
       "opencode-free-first/health-v1": {

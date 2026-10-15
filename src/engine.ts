@@ -623,6 +623,15 @@ export class FreeFirstEngine {
 
   /* -------------------------------------------------------------- controls */
 
+  /**
+   * Re-read shared health. Diagnostics and the RPC call this so a reported
+   * state reflects the whole OpenCode instance, not one location's memory.
+   */
+  async refresh(): Promise<void> {
+    await this.#adoptPersistedCooldown();
+    this.#schedule();
+  }
+
   /** Clear any cooldown because an operator says the limit is lifted. */
   markHealthy(reason: string): void {
     this.#notePrimarySuccess(reason);
@@ -926,6 +935,21 @@ export class FreeFirstEngine {
     const ownCooldown = this.#health.cooldownUntil ?? 0;
     const newer = stored.level > this.#health.level;
     const longer = storedCooldown > ownCooldown;
+
+    // A recovery confirmed elsewhere is as authoritative as a limit: without
+    // this, a stale local cooldown would outlive the recovery that cleared it.
+    const recovered =
+      stored.state === "FREE_HEALTHY" &&
+      stored.lastHealthyAt !== undefined &&
+      stored.lastHealthyAt > (this.#health.lastRateLimitAt ?? 0) &&
+      this.#health.state !== "FREE_HEALTHY";
+    if (recovered) {
+      this.#health = markHealthy(this.#health, stored.lastHealthyAt);
+      if (this.#loggedExpiry === undefined) this.#loggedExpiry = undefined;
+      this.#log("info", "adopted a recovery confirmed by another free-first instance");
+      this.#schedule();
+      return;
+    }
     if (!newer && !longer) return;
     this.#health = {
       ...this.#health,
