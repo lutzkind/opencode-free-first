@@ -1,0 +1,84 @@
+{
+  "name": "opencode-free-first",
+  "version": "0.1.0",
+  "description": "OpenCode v2 plugin that prefers a free model and fails over and recovers around free-tier rate limits.",
+  "author": "Lutz Kind",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/server.ts",
+  "engines": {
+    "node": ">=22",
+    "opencode": ">=2.0.26 <2.1.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "bun": "./src/server.ts",
+      "import": "./dist/server.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "bun": "./src/server.ts",
+      "import": "./dist/server.js"
+    },
+    "./core": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/server.d.ts",
+  "files": [
+    "src",
+    "dist",
+    "index.ts",
+    "server.ts",
+    "docs",
+    "README.md",
+    "AGENTS.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "ARCHITECTURE.md",
+    "DECISIONS.md",
+    "ROADMAP.md",
+    "RELEASING.md"
+  ],
+  "scripts": {
+    "compile": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "biome check src test",
+    "format": "biome format --write src test",
+    "test": "npm run compile && node --test test/*.test.mjs",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "test:integration": "npm run compile && FF_INTEGRATION=1 node --test test/integration.test.mjs",
+    "test:offpeak-regression": "node scripts/offpeak-regression.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-v2",
+    "opencode-cli",
+    "free-tier",
+    "rate-limit",
+    "model-failover",
+    "opencode-zen",
+    "llm-cost-optimization",
+    "deepseek"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lutzkind/opencode-free-first.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lutzkind/opencode-free-first/issues"
+  },
+  "homepage": "https://github.com/lutzkind/opencode-free-first#readme",
+  "dependencies": {
+    "@opencode/plugin": "2.0.26"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "24.12.2",
+    "typescript": "5.8.2"
+  }
+}

@@ -1,0 +1,16 @@
+standard_version: 2.5.2
+profile: node
+default_branch: main
+self_hosted_labels:
+  - self-hosted
+  - Linux
+  - X64
+  - ci
+  - isolated
+heavy_checks:
+  enabled: false
+custom_commands:
+  setup: 'git diff --check'
+  checks: 'git diff --check'
+exceptions:
+  - 'application checks delegated to existing PR CI: .github/workflows/ci.yml'
