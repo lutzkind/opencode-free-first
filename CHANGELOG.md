@@ -3,6 +3,22 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-10-15
+
+### Fixed
+
+- Refresh persisted health before every routing decision, so a long-lived
+  OpenCode service applies a cooldown that another instance (or another
+  location) recorded. Previously an instance that had been running before the
+  limit kept its in-memory healthy state, which could waste one free request and
+  add an unnecessary transition when it moved a session back to a still-limited
+  free model.
+
+### Added
+
+- Unit coverage for cross-instance adoption and for declining to probe while
+  another instance's cooldown is live.
+
 ## [0.1.1] — 2026-10-15
 
 ### Fixed
@@ -63,5 +79,6 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.2]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.2
 [0.1.1]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.0

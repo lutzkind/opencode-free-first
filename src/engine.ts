@@ -289,6 +289,11 @@ export class FreeFirstEngine {
    */
   async onPrompt(sessionID: string): Promise<void> {
     if (!this.#active()) return;
+    // OpenCode loads one plugin instance per location and every instance shares
+    // this plugin's storage, so a cooldown another instance recorded must apply
+    // to this prompt. One keyed read per prompt is the price of a shared
+    // cooldown across a long-lived service.
+    await this.#adoptPersistedCooldown();
     // Settling recovery here (when no probe is already in flight) is deliberate:
     // it decides this very prompt, so it must not be skipped. The work is one
     // tiny request.
@@ -304,6 +309,7 @@ export class FreeFirstEngine {
    */
   async #applyRouting(sessionID: string, state: SessionState, trigger: string): Promise<void> {
     if (state.optOut !== undefined) return;
+    await this.#adoptPersistedCooldown();
     if (this.#inCooldown()) {
       if (this.#isPrimary(state.model ?? this.#config.primary)) {
         await this.#downgrade(sessionID, trigger);
@@ -342,6 +348,9 @@ export class FreeFirstEngine {
 
     const state = await this.#stateWithModel(sessionID);
     if (this.#isFallback(model) && state.managed && state.route === "FALLBACK") {
+      // Another instance may hold a cooldown this one has not seen yet; refresh
+      // before deciding to stop paying for the fallback.
+      await this.#adoptPersistedCooldown();
       // The cooldown has elapsed, so the free model may be tested again and this
       // session should stop paying for the fallback. Recovery is centralised so
       // a passive path can never overtake an in-flight probe.

@@ -21,12 +21,14 @@ async function boot(overrides = {}) {
   return { engine, ...built };
 }
 
-async function failover(engine, sessionID = "ses_a", error = rateLimitError()) {
+async function failoverLike(engine, sessionID = "ses_a", error = rateLimitError()) {
   engine.onModelRequest(sessionID, FREE, "primary");
   const decision = { retry: false };
   await engine.onRetry({ sessionID, model: FREE, error, attempt: 2, decision });
   return decision;
 }
+
+const failover = failoverLike;
 
 function switchTargets(sessions) {
   return sessions
@@ -454,6 +456,46 @@ describe("persistence and restart", () => {
     await clock.advance(60_000);
     assert.equal(sessions.of("switchModel").length, 0);
     assert.equal(engine.status().fallbackSessions, 1, "the hint is reported but not acted on");
+  });
+
+  it("adopts a cooldown another instance recorded before deciding a prompt's route", async () => {
+    const storage = new FakeStorage();
+    const sessions = new FakeSessions({ ses_paid: PAID });
+    const { engine, clock, log } = await boot({ storage, sessions });
+    assert.equal(engine.status().state, "FREE_HEALTHY", "this instance starts healthy");
+    // Another instance records the limit while this one is running.
+    await storage.set("opencode-free-first/health-v1", {
+      schemaVersion: 1,
+      scope: "fake/fake-free",
+      state: "FREE_COOLDOWN",
+      cooldownUntil: clock.now() + 500_000,
+      level: 3,
+    });
+    await engine.onPrompt("ses_paid");
+    assert.equal(engine.status().state, "FREE_COOLDOWN");
+    assert.equal(engine.status().level, 3);
+    assert.ok(log.has("adopted a cooldown recorded by another free-first instance"));
+    // The adopted fallback session must stay on the fallback, not be upgraded.
+    assert.equal(sessions.of("switchModel").length, 0);
+  });
+
+  it("does not probe while another instance holds a live cooldown", async () => {
+    const storage = new FakeStorage({
+      "opencode-free-first/health-v1": {
+        schemaVersion: 1,
+        scope: "fake/fake-free",
+        state: "FREE_COOLDOWN",
+        cooldownUntil: 1_700_000_500_000,
+        level: 2,
+      },
+    });
+    const generate = new FakeGenerate();
+    const { engine, clock } = await boot({ storage, generate });
+    engine.onModelRequest("ses_a", FREE, "primary");
+    await failoverLike(engine, "ses_a");
+    await clock.advance(2_000);
+    assert.equal(engine.status().state, "FREE_COOLDOWN");
+    assert.equal(generate.calls.length, 0, "no probe while another instance's cooldown is live");
   });
 
   it("survives a storage failure", async () => {
