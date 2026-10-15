@@ -94,7 +94,10 @@ Used only when no reset metadata exists:
   therefore shared rather than rediscovered per location, and a stale local
   cooldown cannot outlive a recovery that another instance already confirmed.
   `status` re-reads shared health before reporting, so diagnostics never show a
-  healthy free model while a shared cooldown is active.
+  healthy free model while a shared cooldown is active. The shared record is
+  monotonic with respect to an active cooldown — a write never downgrades it — and
+  a freshly started instance does not claim a recovery, so a start-up can never
+  overwrite a live cooldown.
 
 ## Persistence
 

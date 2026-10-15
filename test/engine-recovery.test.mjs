@@ -526,6 +526,55 @@ describe("persistence and restart", () => {
     assert.equal(generate.calls.length, 0, "no probe while another instance's cooldown is live");
   });
 
+  it("never lets a stale instance clobber a live shared cooldown", async () => {
+    const storage = new FakeStorage();
+    const { engine, clock } = await boot({ storage });
+    assert.equal(engine.status().state, "FREE_HEALTHY");
+    // Another instance records a live cooldown after this one started.
+    await storage.set("opencode-free-first/health-v1", {
+      schemaVersion: 1,
+      scope: "fake/fake-free",
+      state: "FREE_COOLDOWN",
+      cooldownUntil: clock.now() + 600_000,
+      level: 2,
+      lastRateLimitAt: clock.now(),
+      lastRateLimitType: "failover-http-429",
+      lastResetSource: "retry-after",
+    });
+    // Any write from this instance must preserve it.
+    engine.onModelRequest("ses_a", FREE, "primary");
+    await clock.advance(0);
+    const written = storage.plain()["opencode-free-first/health-v1"];
+    assert.equal(written.state, "FREE_COOLDOWN");
+    assert.equal(written.cooldownUntil, clock.now() + 600_000);
+    assert.equal(written.level, 2);
+    assert.equal(engine.status().state, "FREE_COOLDOWN");
+  });
+
+  it("does not claim a recovery just because an instance started", async () => {
+    const storage = new FakeStorage();
+    const first = await boot({ storage });
+    await first.engine.onRetry({
+      sessionID: "ses_a",
+      model: FREE,
+      error: rateLimitError(),
+      attempt: 2,
+      decision: { retry: false },
+    });
+    await first.clock.advance(0);
+    await first.engine.dispose();
+    const before = storage.plain()["opencode-free-first/health-v1"];
+    assert.equal(before.state, "FREE_COOLDOWN");
+    // A second instance starting must not publish a healthy record that looks
+    // like a confirmed recovery.
+    const second = await boot({ storage, clock: new FakeClock(before.cooldownUntil - 1_000) });
+    await second.clock.advance(0);
+    const after = storage.plain()["opencode-free-first/health-v1"];
+    assert.equal(after.state, "FREE_COOLDOWN");
+    assert.equal(after.cooldownUntil, before.cooldownUntil);
+    await second.engine.dispose();
+  });
+
   it("survives a storage failure", async () => {
     const storage = new FakeStorage();
     storage.get = async () => {

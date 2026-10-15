@@ -950,6 +950,11 @@ export class FreeFirstEngine {
       this.#schedule();
       return;
     }
+    // A recovery this instance already confirmed is newer than the stored limit:
+    // there is nothing left to adopt, and pulling the ladder back up would undo a
+    // successful recovery.
+    const ourRecoveryAt = this.#health.state === "FREE_HEALTHY" ? (this.#health.lastHealthyAt ?? 0) : 0;
+    if (ourRecoveryAt > (stored.lastRateLimitAt ?? 0)) return;
     if (!newer && !longer) return;
     this.#health = {
       ...this.#health,
@@ -1000,6 +1005,10 @@ export class FreeFirstEngine {
       return;
     }
     try {
+      // Never let a write downgrade a live cooldown another instance recorded.
+      // This is what keeps the shared record monotonic with respect to an active
+      // cooldown: a stale healthy instance adopts it instead of clobbering it.
+      await this.#adoptPersistedCooldown();
       await this.#storage.set(HEALTH_STORAGE_KEY, this.#health as unknown as never);
       const sessions: Record<string, SessionRecord> = {};
       for (const [sessionID, state] of this.#sessionsState) {

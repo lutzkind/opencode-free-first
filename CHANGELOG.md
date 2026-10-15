@@ -3,6 +3,25 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] — 2026-10-15
+
+### Fixed
+
+- A write from one plugin instance can no longer clobber a live shared cooldown
+  recorded by another. The shared record is now monotonic with respect to an
+  active cooldown: a stale healthy instance adopts the cooldown instead of
+  overwriting it with its own state.
+- A freshly started instance no longer claims a recovery. `lastHealthyAt` is only
+  set by an observed success, a successful probe, or an adopted foreign recovery,
+  so a start-up can never be mistaken for the free model coming back.
+- A recovery this instance already confirmed is never undone by adopting a stale
+  ladder position from the shared record.
+
+### Added
+
+- Unit coverage for shared-cooldown monotonicity and for a restart not claiming a
+  recovery.
+
 ## [0.1.3] — 2026-10-15
 
 ### Fixed
@@ -92,6 +111,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.4]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.4
 [0.1.3]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.3
 [0.1.2]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.2
 [0.1.1]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.1

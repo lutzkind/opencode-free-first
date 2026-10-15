@@ -24,13 +24,18 @@ export interface HealthOptions {
   readonly jitterRatio: number;
 }
 
-export function initialHealth(scope: string, now: number): HealthRecord {
+/**
+ * A fresh instance starts healthy and, deliberately, does **not** claim a
+ * recovery: `lastHealthyAt` is only set by an observed success, a successful
+ * probe, or an adopted foreign recovery. Claiming one at start-up would let a
+ * newly started instance overwrite a cooldown another instance recorded.
+ */
+export function initialHealth(scope: string, _now: number): HealthRecord {
   return {
     schemaVersion: HEALTH_SCHEMA_VERSION,
     scope,
     state: "FREE_HEALTHY",
     level: 0,
-    lastHealthyAt: now,
   };
 }
 
