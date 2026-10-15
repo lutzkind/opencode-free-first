@@ -3,6 +3,16 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-10-15
+
+### Fixed
+
+- Share the cooldown and the backoff position between every plugin instance.
+  OpenCode loads one plugin instance per location, and every instance shares this
+  plugin's storage, so a rate limit discovered in one location is now adopted by
+  the others before they act. This keeps a single free-tier limit from being
+  rediscovered per location and prevents cross-location probe storms.
+
 ## [0.1.0] — 2026-10-15
 
 First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
@@ -53,4 +63,5 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.1]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.0

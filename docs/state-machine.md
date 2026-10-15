@@ -85,6 +85,11 @@ Used only when no reset metadata exists:
 - Parked reclamation runs once per park observation; the park mark is consumed
   before the interruption so a repeated tick cannot reclaim the same request
   twice.
+- **Across instances.** OpenCode loads one plugin instance per location, and every
+  instance shares this plugin's storage. Before recording a limit or issuing a
+  probe, an instance adopts the persisted record when it is more conservative
+  (longer cooldown, higher ladder position), so a limit discovered in one location
+  is shared rather than rediscovered per location.
 
 ## Persistence
 

@@ -499,6 +499,10 @@ export class FreeFirstEngine {
 
     const state = this.#stateFor(input.sessionID);
     const now = this.#clock.now();
+    // Another free-first instance (OpenCode loads one per location) may already
+    // have recorded this provider window. Adopting it keeps the ladder and the
+    // cooldown shared instead of each location discovering the limit alone.
+    await this.#adoptPersistedCooldown();
     const reset = extractReset({
       now,
       headers: this.#lastHeaders.get(input.sessionID),
@@ -897,6 +901,46 @@ export class FreeFirstEngine {
     return target.variant === undefined ? { providerID: target.providerID, id: target.id } : target;
   }
 
+  /**
+   * Take the more conservative of the in-memory and persisted health records.
+   *
+   * OpenCode loads a plugin instance per location, and every instance shares this
+   * plugin's storage. A limit is a property of the provider account, so the
+   * longest live cooldown and the highest ladder position are the truth.
+   */
+  async #adoptPersistedCooldown(): Promise<void> {
+    const raw = await this.#safeGet(HEALTH_STORAGE_KEY);
+    const stored = decodeHealth(raw, modelRefKey(this.#config.primary));
+    if (stored === undefined) return;
+    const now = this.#clock.now();
+    const storedCooldown = stored.cooldownUntil ?? 0;
+    const ownCooldown = this.#health.cooldownUntil ?? 0;
+    const newer = stored.level > this.#health.level;
+    const longer = storedCooldown > ownCooldown;
+    if (!newer && !longer) return;
+    this.#health = {
+      ...this.#health,
+      level: Math.max(this.#health.level, stored.level),
+      ...(storedCooldown > now
+        ? { state: "FREE_COOLDOWN" as const, cooldownUntil: storedCooldown }
+        : {}),
+      ...(stored.lastRateLimitAt === undefined
+        ? {}
+        : { lastRateLimitAt: Math.max(this.#health.lastRateLimitAt ?? 0, stored.lastRateLimitAt) }),
+      ...(stored.lastRateLimitType === undefined
+        ? {}
+        : { lastRateLimitType: stored.lastRateLimitType }),
+      ...(stored.lastResetSource === undefined ? {} : { lastResetSource: stored.lastResetSource }),
+    };
+    if (storedCooldown > now) {
+      this.#log("info", "adopted a cooldown recorded by another free-first instance", {
+        remaining: formatDuration(storedCooldown - now),
+        level: this.#health.level,
+      });
+      this.#schedule();
+    }
+  }
+
   #notePrimarySuccess(reason: string): void {
     if (this.#health.state === "FREE_HEALTHY" && this.#health.level === 0) return;
     const wasCooling = inCooldown(this.#health, this.#clock.now());
@@ -1119,8 +1163,12 @@ export class FreeFirstEngine {
    * model is in cooldown.
    */
   async #runProbe(): Promise<boolean> {
+    await this.#adoptPersistedCooldown();
     const now = this.#clock.now();
-    if (inCooldown(this.#health, now)) return false;
+    if (inCooldown(this.#health, now)) {
+      this.#log("info", "another free-first instance already holds a cooldown; skipping the probe");
+      return false;
+    }
     this.#log("info", "recovery probe started", { model: modelRefKey(this.#config.primary) });
     this.#onProbeState(true);
     try {
