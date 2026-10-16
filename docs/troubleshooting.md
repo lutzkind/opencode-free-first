@@ -3,7 +3,7 @@
 Start with the plugin's own view of the world:
 
 ```sh
-opencode api post /api/rpc/opencode-free-first/control --data '{"action":"status"}'
+opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"status"}}'
 ```
 
 Every decision is also logged with the `[opencode-free-first]` prefix. Set
@@ -135,6 +135,20 @@ that interrupt settles, before the resumed step completes; the session, model,
 and continuation are already correct, so open the session (or use `--continue`)
 to see it finish. The TUI does not have this limitation.
 
+## Compaction spent a free request while FREE was already cooling down
+
+The cooldown now keeps sessions that can reach a step boundary on the fallback,
+so this should not happen. If it does, look for the one window that has no
+supported hook: a cooldown established by another location *while* this session's
+turn is running, between its last hook and its next step boundary (OpenCode
+resolves the compaction's model at that boundary, before any plugin hook). That
+request is treated as the discovery of the limit, so it fails once, records the
+cooldown, moves the session to the fallback, and the next compaction succeeds
+there. `status().compactionRetriesSuppressed` counts the compaction attempts
+that were *not* retried on a limited free model, and `status().cooldownRouting`
+(`runs`, `routed`) shows the routing pass that keeps a known cooldown represented
+in the sessions.
+
 ## Switch churn
 
 Use `status().transitions`. A healthy free period records **zero** transitions. A
@@ -168,11 +182,11 @@ not live there.
 
 - Lift a cooldown you know is gone:
   ```sh
-  opencode api post /api/rpc/opencode-free-first/control --data '{"action":"reset"}'
+  opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"reset"}}'
   ```
 - Pause routing entirely:
   ```sh
-  opencode api post /api/rpc/opencode-free-first/control --data '{"action":"off"}'
+  opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"off"}}'
   ```
   Persisted cooldown state is preserved, and `on` resumes.
 - Permanently forget derived state by removing the

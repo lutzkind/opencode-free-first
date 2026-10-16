@@ -124,7 +124,7 @@ cannot move a session the user repointed while OpenCode was stopped.
 | --- | --- |
 | `model.transform` | Publish the free model as the default selection, capture each model's variant ids, capture OpenCode's own default before overriding it. |
 | `prompt` | Last point before a turn resolves its model: converge routing without spending a request on a model known to be cooling down. |
-| `context` | Observe request preparation (the park signal), and route a fallback session back to the free model when the cooldown has elapsed. |
+| `context` | Observe request preparation (the park signal), adopt a cooldown another instance recorded — in both directions, so a preparation on the free model is guarded too — and route a fallback session back to the free model when the cooldown has elapsed. |
 | `generate` | Bound the recovery probe's output. The probe is best-effort: only a real rate limit may block the free model. |
 | `model.request` | Confirm a request is about to be dispatched — the request is no longer held. |
 | `http.response` | Prove free health from a non-error response; capture reset headers. |
@@ -216,6 +216,55 @@ sessions back to the free model at a safe boundary and lets real traffic confirm
 recovery. That is the cheapest correct path when the session is already going to
 make a call.
 
+## Compaction
+
+OpenCode issues an automatic compaction at the **step boundary**, and that is
+also where it resolves the model the compaction request will use
+(`SessionRunnerLLM.runStep` → `prepareContext` → `context.select` →
+`compaction.compact({ reason: "auto", context })`). Two consequences shape this
+plugin's routing:
+
+- **No hook runs before that resolution.** The `context` and `model.request`
+  hooks fire while the request is being prepared, which is *after* the model was
+  chosen; `prompt` fires before the turn, but a turn that is already running has
+  no new admission. The `compaction` hook exists and fires per compaction
+  request, but it also runs after the resolution (it can only supply the summary
+  and skip the model call). So a switch made from any of them lands on the next
+  attempt or step, never on the compaction that is already resolved.
+- **A prepared compaction cannot change its model.** OpenCode's compaction retry
+  loop is inside `SessionCompaction.deliver`; it consults the `retry` hook, but a
+  retried attempt re-sends the request it prepared, model included. Only the next
+  compaction attempt re-resolves.
+
+The routing rule that follows is enforced in two places:
+
+1. **While a cooldown is active, sessions that can reach a boundary are on their
+   fallback.** Establishing or adopting a cooldown runs a routing pass over every
+   managed session with an active execution (`cooldownRouting` in `status()`) and
+   moves the ones still represented on the free model to their fallback. Idle
+   sessions are skipped: they cannot compact, and both prompt admission and
+   request preparation already route them, so a limit cycle cannot churn them.
+2. **A compaction attempt is never retried on a model that just limited.** The
+   retry decision uses the kind of the request that actually dispatched
+   (`model.request` carries it). A primary request keeps the failover retry —
+   OpenCode re-resolves it — while a compaction is answered with
+   `{ retry: false }` and the session moves to the fallback, so the next
+   compaction runs there instead of spending the same doomed request again.
+
+A compaction that *discovers* a limit is different and stays visible: that
+request is the discovery, so the compaction fails once, the cooldown is
+recorded, the session moves to the fallback, and the retried compaction succeeds
+there. The unique case where the free model is still spent is a cooldown another
+location established mid-turn in this location, between this session's last hook
+and its next boundary: no supported hook exists in that window, so that request
+is treated as a genuine discovery too.
+
+The same rule covers park reclamation: when a held paid compaction is reclaimed
+because the free model recovered first, the released request is refused at the
+transport boundary, the attempt is not retried (it would re-send the paid
+request), and one invisible continuation resumes the turn so the compaction
+completes on the free model.
+
 ## Park reclamation
 
 A cost/time policy plugin can hold a request *inside* its own pre-model hook. In
@@ -303,7 +352,7 @@ pattern is considered.
 
 Every switch is recorded as `<timestamp> <trigger> -> provider/model`, where the
 trigger is one of `failover`, `prompt-admission`, `context-guard`,
-`passive-recovery`, `probe-recovery`, or `park-preemption`. The last 40 are
+`passive-recovery`, `probe-recovery`, `park-preemption`, or `cooldown-guard`. The last 40 are
 exposed through `status().transitions`, which is what the switch-churn tests
 assert against: a complete free-limit cycle is exactly two transitions.
 

@@ -3,6 +3,64 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] — 2026-10-16
+
+### Fixed
+
+- **A compaction that begins while FREE is already in a confirmed cooldown no
+  longer spends a doomed free request.** OpenCode resolves a request's model at
+  the step boundary — before any plugin hook runs — and it issues an automatic
+  compaction at that same boundary. A compaction attempt that was already
+  prepared cannot be re-routed either: OpenCode's compaction retry re-sends the
+  request it prepared. So the `context` hook was structurally too late for a
+  compaction, and the session kept spending a free request that free-first
+  already knew would be limited, surfacing a failed `Rate limit exceeded`
+  compaction even though the cooldown was known.
+
+  A cooldown now keeps the sessions that can reach such a boundary on the
+  fallback: every managed session with an active execution is moved to its
+  fallback as soon as a cooldown is established or adopted, and the shared
+  cooldown is adopted at every request preparation (not only at prompt
+  admission), so another instance's limit applies here before the next step
+  boundary resolves a model. Idle sessions are deliberately left alone — they
+  cannot compact, and prompt admission plus preparation both route them — so a
+  limit cycle never churns sessions that were not going to spend a request.
+
+- **A compaction attempt is not retried on a free model that has just
+  limited.** The retry decision now uses the kind of the request that was
+  actually dispatched: a primary request is re-resolved by OpenCode when it is
+  retried, while a compaction re-sends its own prepared model, so retrying it
+  would only spend the same doomed request again. The session is still moved to
+  the fallback, so the next compaction runs there.
+
+- **A cancelled paid compaction does not dispatch instead.** When a held paid
+  compaction is reclaimed because FREE recovered first, the released request is
+  refused at the transport boundary (v0.1.7 behaviour). Because a compaction
+  attempt cannot change its model on retry, authorizing the retry would have
+  dispatched exactly the paid request that was just cancelled; instead the
+  attempt ends, one invisible continuation resumes the turn, and the compaction
+  completes on the free model.
+
+### Changed
+
+- `status()` adds `cooldownRouting` (`runs`, `routed`) and
+  `compactionRetriesSuppressed`.
+
+### Documentation
+
+- **RPC examples corrected.** OpenCode's generic RPC endpoint wraps its
+  argument, so the documented command is
+  `--data '{"input":{"action":"status"}}'`. A package test now fails if a bare
+  `{"action":…}` example returns to the shipped documentation.
+
+### Evidence
+
+- 198 unit tests (14 new for compaction routing and retry decisions), 11
+  integration cases including the two required compaction scenarios: a known
+  cooldown issues the compaction on the fallback with zero free requests, and a
+  genuine free limit discovered by a compaction fails over without being
+  retried.
+
 ## [0.1.7] — 2026-10-16
 
 ### Fixed
@@ -195,6 +253,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.8]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.8
 [0.1.7]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.7
 [0.1.6]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.6
 [0.1.5]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.5

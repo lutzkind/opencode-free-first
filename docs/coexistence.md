@@ -70,6 +70,22 @@ headless `opencode run` as well as by a live server. When the policy plugin has
 no cancellation capability, free-first falls back to the interrupt-based
 sequence, whose headless limitation is documented in `docs/troubleshooting.md`.
 
+### 3b — A compaction starts while FREE is already cooling down
+
+OpenCode resolves an automatic compaction's model at the step boundary, before
+any plugin hook runs, and a prepared compaction re-sends that model when it is
+retried. Free-first therefore keeps the sessions that can reach that boundary —
+the ones with an active execution — on the fallback as soon as the cooldown is
+known, and answers a compaction which discovers a limit with "do not retry" so it
+moves to the fallback instead of spending the same doomed request again.
+
+```
+known cooldown            → the session is already on the fallback
+automatic compaction      → resolved on the fallback, zero free requests
+genuine limit discovered  → one failed compaction, cooldown recorded, session
+                            moves to the fallback, the retry compacts there
+```
+
 ### 4 — Free model still limited
 
 The probe is rate limited, the cooldown is extended, and the fallback keeps

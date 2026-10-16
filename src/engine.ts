@@ -154,6 +154,14 @@ export interface EngineStatus {
   readonly holdCancels?: { accepted: number; committed: number; unavailable: number };
   /** Sessions waiting for a refused fallback attempt to return to the free model. */
   readonly pendingResumes?: number;
+  /**
+   * While a cooldown is active, sessions moved to the fallback so no request —
+   * including an automatic compaction — resolves the free model at a step
+   * boundary that has no hook.
+   */
+  readonly cooldownRouting?: { runs: number; routed: number };
+  /** Compaction attempts whose retry was suppressed because the model cannot change. */
+  readonly compactionRetriesSuppressed?: number;
   readonly managedSessions: number;
   readonly fallbackSessions: number;
   readonly managedSessionIds: readonly string[];
@@ -177,6 +185,12 @@ interface PrepareMark {
 }
 
 const MAX_TRANSITIONS = 40;
+/**
+ * How long a confirmed dispatch stays recent enough to decide whether a retry
+ * can change anything. OpenCode re-resolves the model for every retried primary
+ * attempt, but a compaction attempt re-sends the model it was prepared with.
+ */
+const COMPACTION_RETRY_WINDOW_MS = 60_000;
 /**
  * How long a cancellation request stays eligible for its refused attempt to
  * come back through the retry hook. A refusal is a transport failure that
@@ -220,6 +234,19 @@ export class FreeFirstEngine {
    * returns the session to the free model.
    */
   readonly #pendingResumes = new Map<string, number>();
+  /**
+   * The last request this instance confirmed as dispatching, with its kind.
+   * The retry decision depends on it: a primary request is re-resolved by the
+   * runner when it is retried, while a compaction request re-sends its own
+   * prepared model.
+   */
+  readonly #lastDispatch = new Map<string, { kind: string; model: ModelRef; at: number }>();
+  /** One cooldown routing pass at a time; a request during a pass re-runs it. */
+  #cooldownRouting: Promise<void> | undefined;
+  #cooldownRoutingPending = false;
+  #cooldownRoutingRuns = 0;
+  #cooldownRoutedSessions = 0;
+  #compactionRetriesSuppressed = 0;
 
   #transitions: string[] = [];
   #loggedExpiry: number | undefined;
@@ -332,6 +359,11 @@ export class FreeFirstEngine {
     if (this.#expireCooldown() && this.#probe === undefined) await this.#recovery();
     const state = await this.#stateWithModel(sessionID);
     await this.#applyRouting(sessionID, state, "prompt-admission");
+    // Prompt admission is followed by the step boundary that resolves the model
+    // for the turn — including for an automatic compaction. Keep every other
+    // managed session on the fallback too, so none of them can spend a doomed
+    // free request at that boundary.
+    await this.#enforceCooldownRouting("cooldown-guard");
   }
 
   /**
@@ -378,11 +410,16 @@ export class FreeFirstEngine {
     }
     this.#schedule();
 
+    // Another instance may hold a cooldown this one has not seen yet. Every
+    // request preparation refreshes that view — in both directions, because a
+    // preparation on the free model must not be sent while FREE is known to be
+    // unavailable, and a preparation on the fallback is where recovery is
+    // decided. This is the read that makes a shared cooldown authoritative
+    // before the *next* step boundary resolves a model.
+    await this.#adoptPersistedCooldown();
+
     const state = await this.#stateWithModel(sessionID);
     if (this.#isFallback(model) && state.managed && state.route === "FALLBACK") {
-      // Another instance may hold a cooldown this one has not seen yet; refresh
-      // before deciding to stop paying for the fallback.
-      await this.#adoptPersistedCooldown();
       // The cooldown has elapsed, so the free model may be tested again and this
       // session should stop paying for the fallback. Recovery is centralised so
       // a passive path can never overtake an in-flight probe.
@@ -393,6 +430,7 @@ export class FreeFirstEngine {
     if (this.#isPrimary(model) && state.managed && this.#inCooldown()) {
       await this.#downgrade(sessionID, "context-guard");
     }
+    await this.#enforceCooldownRouting("cooldown-guard");
   }
 
   /** The request is about to be dispatched: no plugin is holding it. */
@@ -408,6 +446,13 @@ export class FreeFirstEngine {
     }
     const mark = this.#prepared.get(sessionID);
     if (mark !== undefined && sameModel(mark.model, model)) mark.dispatched = true;
+    // Remember what kind of request is actually on the wire: the retry decision
+    // below has to know whether the model of the retried attempt can change.
+    this.#lastDispatch.set(sessionID, {
+      kind: kind ?? "unknown",
+      model,
+      at: this.#clock.now(),
+    });
 
     const state = this.#stateFor(sessionID);
     if (this.#isPrimary(model)) {
@@ -507,12 +552,20 @@ export class FreeFirstEngine {
     if (event.phase === "started") {
       this.#executing.add(event.sessionID);
       this.#schedule();
+      // A turn can reach a step boundary — and therefore an automatic
+      // compaction — without any prompt admission in between, so routing the
+      // known sessions here is another chance to be on the fallback before that
+      // boundary resolves a model. It is a push, not a guarantee: a pass that
+      // loses the race is still correct, because the compaction's own failure
+      // classifies the limit and routes the session for the next attempt.
+      void this.#enforceCooldownRouting("cooldown-guard").catch(this.#onError);
       return;
     }
     this.#executing.delete(event.sessionID);
     this.#prepared.delete(event.sessionID);
     // A settled execution cannot be resumed by a refused attempt any more.
     this.#pendingResumes.delete(event.sessionID);
+    this.#lastDispatch.delete(event.sessionID);
     // A settled execution is deliberately NOT a free-health proof: the turn may
     // have succeeded on the fallback model. Only a response from the free model
     // itself, or a probe, may clear a cooldown.
@@ -615,6 +668,26 @@ export class FreeFirstEngine {
       });
     }
 
+    // A compaction request cannot change its model when OpenCode retries it: the
+    // compaction re-sends the request it prepared. Retrying it on the free model
+    // after that model just limited would only spend more doomed free requests,
+    // and would expose the same failure again. A primary request is different —
+    // the runner re-resolves it for the retried attempt — so it keeps the retry.
+    const dispatched = this.#lastDispatch.get(input.sessionID);
+    const fixedModel =
+      dispatched !== undefined &&
+      dispatched.kind === "compaction" &&
+      sameModel(dispatched.model, input.model) &&
+      now - dispatched.at <= COMPACTION_RETRY_WINDOW_MS;
+    if (fixedModel) {
+      this.#compactionRetriesSuppressed += 1;
+      this.#log("info", "compaction request is not retried on a just-limited free model", {
+        sessionID: input.sessionID,
+        model: modelRefKey(input.model),
+        dispatchKind: dispatched?.kind,
+      });
+    }
+
     if (state.optOut !== undefined) {
       // The user pointed this session at another model. The limit is real and the
       // cooldown is shared, but moving this session is not free-first's call.
@@ -622,6 +695,7 @@ export class FreeFirstEngine {
         sessionID: input.sessionID,
         optOut: state.optOut,
       });
+      if (fixedModel) input.decision = { retry: false };
       this.#schedule();
       return;
     }
@@ -645,11 +719,13 @@ export class FreeFirstEngine {
       state.model = fallback;
       state.updatedAt = now;
       this.#markDirty();
-      input.decision = { retry: true, delay: this.#config.failoverRetryDelayMs };
+      input.decision = fixedModel
+        ? { retry: false }
+        : { retry: true, delay: this.#config.failoverRetryDelayMs };
       this.#log("info", "fallback selected", {
         sessionID: input.sessionID,
         model: modelRefKey(fallback),
-        retryDelayMs: this.#config.failoverRetryDelayMs,
+        retryDelayMs: fixedModel ? undefined : this.#config.failoverRetryDelayMs,
       });
     } catch (error) {
       this.#log("error", "failed to switch session to the fallback model", {
@@ -659,6 +735,11 @@ export class FreeFirstEngine {
       this.#onError(error);
       input.decision = { retry: false };
     }
+    // The cooldown is now authoritative here, so every managed session this
+    // instance knows stops being represented on the free model immediately
+    // instead of at its next hook. That is what keeps an automatic compaction
+    // from resolving the free model at a step boundary.
+    await this.#enforceCooldownRouting("cooldown-guard");
     this.#schedule();
   }
 
@@ -670,6 +751,7 @@ export class FreeFirstEngine {
    */
   async refresh(): Promise<void> {
     await this.#adoptPersistedCooldown();
+    await this.#enforceCooldownRouting("cooldown-guard");
     this.#schedule();
   }
 
@@ -759,6 +841,11 @@ export class FreeFirstEngine {
         : { holdCancelCapability: this.#paidHolds.capability() }),
       ...(this.#paidHolds === undefined ? {} : { holdCancels: this.#paidHolds.calls() }),
       pendingResumes: this.#pendingResumes.size,
+      cooldownRouting: {
+        runs: this.#cooldownRoutingRuns,
+        routed: this.#cooldownRoutedSessions,
+      },
+      compactionRetriesSuppressed: this.#compactionRetriesSuppressed,
       ...(this.#health.lastProbeOutcome === undefined
         ? {}
         : { lastProbeOutcome: this.#health.lastProbeOutcome }),
@@ -856,6 +943,65 @@ export class FreeFirstEngine {
     return inCooldown(this.#health, this.#clock.now());
   }
 
+  /**
+   * Keep managed sessions on the fallback model while a cooldown is active.
+   *
+   * OpenCode resolves a request's model at the step boundary, before any plugin
+   * hook runs, and an automatic compaction is issued at that same boundary. A
+   * compaction attempt that was already prepared cannot be re-routed either: its
+   * retry re-sends the model it resolved. The only supported way to keep a
+   * compaction off a free model that is known to be unavailable is therefore to
+   * have the session represented on the fallback *before* the boundary.
+   *
+   * This pass is the proactive half of that: as soon as a cooldown is known —
+   * established here or adopted from another instance — every managed session
+   * with an active execution that is still represented on the free model is
+   * moved to its fallback. Executing turns are the ones that can reach a step
+   * boundary with no hook in between; an idle session cannot compact, and its
+   * next activity goes through prompt admission or a request preparation, both
+   * of which route it. Restricting the pass this way keeps a limit cycle from
+   * churning sessions that were never going to spend a request.
+   *
+   * It is idempotent (a session already on the fallback is left alone, so no
+   * duplicate switch or event is produced) and it never upgrades: recovery keeps
+   * owning the way back to the free model.
+   */
+  async #enforceCooldownRouting(trigger: string): Promise<void> {
+    if (!this.#active()) return;
+    if (!this.#inCooldown()) return;
+    if (this.#cooldownRouting !== undefined) {
+      // A pass is already running; it will run again to pick up anything that
+      // appeared while it was working, including state it just learned.
+      this.#cooldownRoutingPending = true;
+      return this.#cooldownRouting;
+    }
+    this.#cooldownRouting = (async () => {
+      try {
+        do {
+          this.#cooldownRoutingPending = false;
+          this.#cooldownRoutingRuns += 1;
+          for (const sessionID of [...this.#sessionsState.keys()]) {
+            if (!this.#active() || !this.#inCooldown()) return;
+            if (!this.#executing.has(sessionID)) continue;
+            const state = await this.#stateWithModel(sessionID);
+            if (state.optOut !== undefined) continue;
+            if (!state.managed) continue;
+            // Only a session represented on the free model is at risk; a session
+            // on another model is deliberately not touched, and a model that
+            // cannot be verified is never guessed at.
+            if (!this.#isPrimary(state.model)) continue;
+            const wasFallback = state.route === "FALLBACK";
+            await this.#downgrade(sessionID, trigger);
+            if (!wasFallback && state.route === "FALLBACK") this.#cooldownRoutedSessions += 1;
+          }
+        } while (this.#cooldownRoutingPending && this.#active() && this.#inCooldown());
+      } finally {
+        this.#cooldownRouting = undefined;
+      }
+    })();
+    return this.#cooldownRouting;
+  }
+
   async #downgrade(sessionID: string, trigger: string): Promise<void> {
     const state = this.#stateFor(sessionID);
     const fallback = await this.#resolveFallback(sessionID, state.model);
@@ -921,6 +1067,45 @@ export class FreeFirstEngine {
           status: input.error.status ?? 0,
         },
       );
+      return;
+    }
+    const dispatched = this.#lastDispatch.get(input.sessionID);
+    const cancelledCompaction =
+      dispatched !== undefined &&
+      dispatched.kind === "compaction" &&
+      sameModel(dispatched.model, input.model) &&
+      now - dispatched.at <= COMPACTION_RETRY_WINDOW_MS;
+    if (cancelledCompaction) {
+      // The cancelled request was a compaction. OpenCode re-sends a compaction
+      // attempt's own prepared model when it retries, so authorizing the retry
+      // here would dispatch exactly the paid request that was just cancelled.
+      // Fail this attempt instead, resume the turn once, and let the compaction
+      // run on the free model the session is now routed to.
+      this.#pendingResumes.delete(input.sessionID);
+      this.#compactionRetriesSuppressed += 1;
+      input.decision = { retry: false };
+      this.#log(
+        "info",
+        "cancelled compaction attempt is not retried; resuming the task on the free model",
+        {
+          sessionID: input.sessionID,
+          model: modelRefKey(input.model),
+          dispatchKind: dispatched?.kind,
+        },
+      );
+      try {
+        await this.#sessions.synthetic({
+          sessionID: input.sessionID,
+          text: this.#config.continuationText,
+          delivery: "steer",
+          resume: true,
+        });
+      } catch (error) {
+        this.#log("error", "failed to resume the task after a cancelled compaction", {
+          sessionID: input.sessionID,
+        });
+        this.#onError(error);
+      }
       return;
     }
     if (inCooldown(this.#health, now)) {

@@ -5,6 +5,10 @@ it, so each item needs evidence before it is implemented.
 
 ## Recently closed
 
+- **Compaction against a known cooldown (v0.1.8).** Closed by keeping the
+  sessions that can reach a step boundary on the fallback while a cooldown is
+  active, and by never retrying a compaction on a model that just limited.
+
 - **Headless `opencode run` and park reclamation (v0.1.7).** Closed without
   changing OpenCode: reclamation now cancels the held request through the parking
   plugin's generic `cancelHold` capability, and the cancelled attempt is refused

@@ -203,6 +203,37 @@ input, two model transitions, one session, and the free model at the end), plus
 unit coverage of the committed race, the unavailable capability, the resume
 guards, and the degraded interrupt path.
 
+## 024 — A known cooldown is represented in the session, because compaction resolves before any hook
+
+OpenCode resolves a request's model at the step boundary, before any plugin hook
+runs, and it issues an automatic compaction at that same boundary. A prepared
+compaction cannot be re-routed either: its retry re-sends the request it resolved
+(verified in OpenCode 2.0.30's `SessionRunnerLLM.runStep`,
+`SessionContext.select`, `SessionCompaction.compact`/`deliver`, and
+`SessionModelRequest.prepare`). The lazy strategy — guard at `prompt` admission
+and at each request preparation — is therefore structurally too late for a
+compaction, and a session left on the free model through a known cooldown spends
+a doomed free request and surfaces a failed `Rate limit exceeded` compaction.
+
+The fix is to keep the *representation* true instead: while a cooldown is active,
+every managed session with an active execution is moved to its fallback as soon
+as the cooldown is established or adopted, and the shared cooldown is adopted at
+every request preparation. Idle sessions are deliberately skipped — they cannot
+compact, and both prompt admission and preparation route them — which keeps a
+limit cycle from churning sessions that were never going to spend a request. The
+retry decision learns from the dispatched request's kind for the same reason: a
+primary request is re-resolved on retry, a compaction is not, so a compaction
+that just limited is answered `{ retry: false }` while the session moves to the
+fallback for the next attempt. A cancelled paid compaction follows the same rule
+so the reclaim cannot dispatch the request it just cancelled.
+
+Evidence: unit coverage for the routing pass, adoption from another instance,
+idempotence, idle sessions, overrides, expiry and the retry-kind decisions; and
+integration cases that run the real CLI — a known cooldown issues the compaction
+on the fallback with zero free requests and no failed compaction, and a genuine
+limit discovered by a compaction fails over and succeeds exactly once on the
+fallback.
+
 ## 017 — No paid traffic to keep a cache warm
 
 There is no evidence that warming the paid fallback's prompt cache pays for the

@@ -14,6 +14,36 @@ describe("package shape", () => {
     assert.equal(pkg.dependencies["@opencode/plugin"], "2.0.26");
   });
 
+  /**
+   * The neighbour is a runtime neighbour, never a dependency: cooperation goes
+   * through the optional RPC contract, and either plugin works alone.
+   */
+  it("depends on OpenCode only, never on the neighbouring plugin", () => {
+    const declared = {
+      ...pkg.dependencies,
+      ...(pkg.peerDependencies ?? {}),
+      ...(pkg.optionalDependencies ?? {}),
+    };
+    assert.equal(
+      Object.keys(declared).some((name) => name.includes("offpeak")),
+      false,
+      "opencode-offpeak must never be a package dependency",
+    );
+    for (const file of ["src/server.ts", "src/engine.ts", "src/offpeak.ts", "src/config.ts"]) {
+      const text = readFileSync(path.join(root, file), "utf8");
+      assert.equal(
+        /from\s+["'][^"']*opencode-offpeak/.test(text),
+        false,
+        `${file} must not import the neighbour's source`,
+      );
+      assert.equal(
+        /import\(["'][^"']*opencode-offpeak/.test(text),
+        false,
+        `${file} must not dynamically import the neighbour`,
+      );
+    }
+  });
+
   it("keeps the runtime entrypoints the host resolves", () => {
     assert.equal(pkg.main, "./src/server.ts");
     assert.equal(pkg.exports["."].bun, "./src/server.ts");
@@ -22,6 +52,28 @@ describe("package shape", () => {
     // A directory install resolves `<dir>/server` and `<dir>/index`.
     assert.ok(existsSync(path.join(root, "server.ts")));
     assert.ok(existsSync(path.join(root, "index.ts")));
+  });
+
+  /**
+   * The RPC endpoint OpenCode exposes wraps its argument in an `input` field.
+   * A bare action was documented once and cost real debugging time, so the
+   * examples in the shipped docs are checked here.
+   */
+  it("documents the RPC envelope OpenCode actually accepts", () => {
+    for (const file of ["README.md", "docs/troubleshooting.md", "docs/coexistence.md"]) {
+      const target = path.join(root, file);
+      if (!existsSync(target)) continue;
+      const text = readFileSync(target, "utf8");
+      assert.equal(
+        /--data '\{"action"/.test(text),
+        false,
+        `${file} must wrap the RPC argument in "input"`,
+      );
+      for (const match of text.matchAll(/--data '(\{[^']*\})'/g)) {
+        const parsed = JSON.parse(match[1].replace(/\\(.)/g, "$1"));
+        assert.ok("input" in parsed, `${file} RPC example without an input envelope`);
+      }
+    }
   });
 
   it("ships the sources the host executes and the compiled fallback", () => {

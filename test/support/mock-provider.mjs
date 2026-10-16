@@ -31,6 +31,13 @@ function defaults() {
     retryAfterSeconds: undefined,
     delayMs: 0,
     /**
+     * Prompt tokens reported on this role's responses. OpenCode treats the last
+     * response's usage as the measured prompt size, so a large value is how a
+     * scenario makes an automatic compaction due without generating a huge
+     * transcript: the window is 200k and this reports it as nearly full.
+     */
+    promptTokens: 10,
+    /**
      * Refuse the out-of-band recovery probe, identified by its configured
      * prompt marker. OpenCode's own free tier does this
      * (`Generate.UnavailableError`), so this models a host that refuses the
@@ -73,7 +80,46 @@ function chunk(payload) {
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
 
-function stream(response, model) {
+/**
+ * A compaction reply has to fill OpenCode's summary template, or the compaction
+ * counts as failed. This is the smallest valid summary.
+ */
+const COMPACTION_SUMMARY = [
+  "## Objective",
+  "- Continue the task.",
+  "",
+  "## Requirements",
+  "- (none)",
+  "",
+  "## Decisions",
+  "- (none)",
+  "",
+  "## Work State",
+  "### Completed",
+  "- (none)",
+  "",
+  "### Active",
+  "- (none)",
+  "",
+  "### Blocked",
+  "- (none)",
+  "",
+  "## Next Move",
+  "1. (none)",
+  "",
+  "## Relevant Files",
+  "- (none)",
+  "",
+  "## Important Context",
+  "- mock summary",
+].join("\n");
+
+/** True when the request is OpenCode's compaction summary prompt. */
+function isCompaction(raw) {
+  return raw.includes("Summarize only what the user and the assistant said and did");
+}
+
+function stream(response, model, options = {}) {
   const created = Math.floor(Date.now() / 1000);
   // A client that disconnects mid-stream must not take the mock down: the
   // integration run exits as soon as it has the answer.
@@ -85,11 +131,26 @@ function stream(response, model) {
     connection: "keep-alive",
   });
   const base = { id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created, model };
+  const text = options.compaction === true ? COMPACTION_SUMMARY : `MOCK_OK model=${model}`;
+  const halves = [
+    text.slice(0, Math.ceil(text.length / 2)),
+    text.slice(Math.ceil(text.length / 2)),
+  ];
   const frames = [
     { ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
-    { ...base, choices: [{ index: 0, delta: { content: "MOCK_OK " }, finish_reason: null }] },
-    { ...base, choices: [{ index: 0, delta: { content: `model=${model}` }, finish_reason: null }] },
+    { ...base, choices: [{ index: 0, delta: { content: halves[0] }, finish_reason: null }] },
+    { ...base, choices: [{ index: 0, delta: { content: halves[1] }, finish_reason: null }] },
     { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    // The trailing usage chunk OpenCode asks for with stream_options.include_usage.
+    {
+      ...base,
+      choices: [],
+      usage: {
+        prompt_tokens: Number(options.promptTokens ?? 10),
+        completion_tokens: 8,
+        total_tokens: Number(options.promptTokens ?? 10) + 8,
+      },
+    },
   ];
   let index = 0;
   const pump = () => {
@@ -156,10 +217,12 @@ const server = http.createServer(async (request, response) => {
   const failing = config.mode !== "ok" && served[role] <= limit;
   const effective = failing ? config.mode : "ok";
   const model = String(parsed.model ?? "");
+  const compaction = isCompaction(raw);
   state.log.push({
     event: "request",
     model,
     role,
+    compaction,
     stream: parsed.stream === true,
     messages: Array.isArray(parsed.messages) ? parsed.messages.length : undefined,
     tools: Array.isArray(parsed.tools) ? parsed.tools.length : undefined,
@@ -189,7 +252,7 @@ const server = http.createServer(async (request, response) => {
       config.retryAfterSeconds === undefined
         ? {}
         : { "retry-after": String(config.retryAfterSeconds) };
-    state.log.push({ event: "error-response", model, status, message });
+    state.log.push({ event: "error-response", model, status, message, compaction });
     sendJson(
       response,
       status,
@@ -206,7 +269,10 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (parsed.stream === true) {
-    stream(response, model);
+    stream(response, model, {
+      compaction,
+      promptTokens: config.promptTokens,
+    });
     return;
   }
   sendJson(response, 200, {
@@ -217,11 +283,18 @@ const server = http.createServer(async (request, response) => {
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: `MOCK_OK model=${model}` },
+        message: {
+          role: "assistant",
+          content: compaction ? COMPACTION_SUMMARY : `MOCK_OK model=${model}`,
+        },
         finish_reason: "stop",
       },
     ],
-    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    usage: {
+      prompt_tokens: Number(config.promptTokens ?? 10),
+      completion_tokens: 5,
+      total_tokens: Number(config.promptTokens ?? 10) + 5,
+    },
   });
 });
 

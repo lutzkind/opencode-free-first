@@ -77,31 +77,17 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       });
     });
 
+    writeConfig(coexistencePlugins);
+  });
+
+  /** The whole OpenCode configuration, so a case can swap the plugin list. */
+  function writeConfig(plugins) {
     writeJson(path.join(home, "config", "opencode", "opencode.json"), {
       $schema: "https://opencode.ai/config.json",
       permissions: [{ action: "*", resource: "*", effect: "allow" }],
       websearch: false,
       model: "ffmock/ff-free",
-      plugins: [
-        OFFPEAK_SPEC,
-        {
-          package: repo,
-          options: {
-            primary: { providerID: "ffmock", id: "ff-free" },
-            fallback: { providerID: "ffmock", id: "ff-paid" },
-            preferAsDefault: true,
-            adoptFallbackSessions: true,
-            backoffMs: [2_000, 4_000, 8_000],
-            maxCooldownMs: 8_000,
-            jitterRatio: 0,
-            failoverRetryDelayMs: 50,
-            parkGraceMs: 1_200,
-            // A distinctive probe prompt lets the mock gate exactly the probe.
-            probePrompt: "FF_PROBE_PROBE_ONLY",
-            logLevel: "debug",
-          },
-        },
-      ],
+      plugins,
       providers: {
         ffmock: {
           name: "FF Mock",
@@ -114,12 +100,27 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
         },
       },
     });
-  });
+  }
 
-  after(() => {
-    if (mock) mock.kill("SIGKILL");
-    if (home && process.env.FF_KEEP_HOME !== "1") rmSync(home, { recursive: true, force: true });
-  });
+  /** The layout every coexistence case runs against. */
+  const freeFirstOptions = {
+    primary: { providerID: "ffmock", id: "ff-free" },
+    fallback: { providerID: "ffmock", id: "ff-paid" },
+    preferAsDefault: true,
+    adoptFallbackSessions: true,
+    backoffMs: [2_000, 4_000, 8_000],
+    maxCooldownMs: 8_000,
+    jitterRatio: 0,
+    failoverRetryDelayMs: 50,
+    parkGraceMs: 1_200,
+    // A distinctive probe prompt lets the mock gate exactly the probe.
+    probePrompt: "FF_PROBE_PROBE_ONLY",
+    logLevel: "debug",
+  };
+  const coexistencePlugins = [
+    OFFPEAK_SPEC,
+    { package: repo, options: freeFirstOptions },
+  ];
 
   function offpeakConfig(policy) {
     writeJson(path.join(home, "config", "opencode", "offpeak.json"), {
@@ -130,6 +131,11 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       ...(policy === undefined ? {} : { policies: [policy] }),
     });
   }
+
+  after(() => {
+    if (mock) mock.kill("SIGKILL");
+    if (home && process.env.FF_KEEP_HOME !== "1") rmSync(home, { recursive: true, force: true });
+  });
 
   /**
    * Apply mock behaviour. Every role is reset to a known baseline first, and
@@ -237,6 +243,67 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
   /** Every model the provider was asked for, in order. */
   function models(state) {
     return state.log.filter((entry) => entry.event === "request").map((entry) => entry.model);
+  }
+
+  /** Provider requests this mock identified as OpenCode's compaction summary. */
+  function compactionRequests(state, role) {
+    return state.log.filter(
+      (entry) => entry.event === "request" && entry.compaction === true && entry.role === role,
+    );
+  }
+
+  /** The session's compaction messages, as OpenCode persisted them. */
+  function compactions(record) {
+    return record.messages.filter((message) => message.type === "compaction");
+  }
+
+  /**
+   * A policy that never holds anything, so a case can assert where a request
+   * went without another plugin delaying it.
+   */
+  function flatPolicy() {
+    return {
+      id: "ffmock-flat",
+      providers: ["ffmock"],
+      models: ["ff-paid"],
+      flatModels: ["ff-free"],
+      timeZone: "UTC",
+      // A policy must define at least one window. This one covers the first
+      // minute of the UTC day only, so the paid route is effectively never held
+      // and the case can assert where a request went.
+      blocked: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "00:01" }],
+      multiplier: 2,
+      source: "integration test",
+    };
+  }
+
+  /**
+   * The known-cooldown setup every compaction case starts from.
+   *
+   * Turn 1 is a normal turn whose title request discovers the free-tier limit:
+   * free-first fails the session over, and the cooldown it records is long
+   * enough to stay valid for the rest of the case. Both roles report a nearly
+   * full window, so the *next* turn's step boundary is where OpenCode issues an
+   * automatic compaction — the boundary that resolves its model before any
+   * plugin hook runs.
+   */
+  async function knownCooldownTurn({ retryAfterSeconds = 120, freeMode = "429" } = {}) {
+    await control({
+      log: [],
+      free: {
+        mode: freeMode,
+        ...(freeMode === "ok" ? {} : { retryAfterSeconds }),
+        promptTokens: 190_000,
+      },
+      paid: { mode: "ok", promptTokens: 190_000 },
+    });
+    const first = await run("Reply with the word READY");
+    const state = await mockState();
+    const record = transcript();
+    const sessionID = record.session?.id;
+    assert.ok(sessionID, `turn 1 did not persist a session:\n${first.stdout.slice(-2_000)}`);
+    assertOk(first);
+    return { first, state, record, sessionID };
   }
 
   it("Case 1 — a healthy free model is used and offpeak stays out of the way", async () => {
@@ -702,6 +769,254 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       0,
       "no delayed paid dispatch after the run",
     );
+    offpeakConfig(undefined);
+  });
+
+  it("Case 8 — a compaction that starts while FREE is already cooling down never reaches the free provider", async () => {
+    // Required scenario 1: known cooldown before compaction.
+    //
+    // OpenCode resolves the compaction's model at the step boundary, and a
+    // retried compaction re-sends the model it resolved. A session still
+    // represented on the free model at that boundary therefore spends a free
+    // request that free-first already knows will be limited — the defect this
+    // case covers. Every free request fails for the whole case, so the only way
+    // turn 2 can answer at all is on the fallback.
+    offpeakConfig(flatPolicy());
+    reset();
+    const first = await knownCooldownTurn();
+    assert.equal(
+      first.state.log.some((entry) => entry.event === "error-response"),
+      true,
+      "turn 1 discovered the free-tier limit",
+    );
+    assert.match(first.first.stdout, /MOCK_OK model=ff-paid/);
+
+    // Turn 2: the window is measured as nearly full, so this turn issues an
+    // automatic compaction at its step boundary — before its own primary
+    // request, and before any plugin hook can run.
+    await control({
+      log: [],
+      free: { mode: "429", failFirst: null, retryAfterSeconds: 120, promptTokens: 190_000 },
+      paid: { mode: "ok", promptTokens: 190_000 },
+    });
+    const second = await run("Continue", ["--session", first.sessionID]);
+    assertOk(second);
+    const state = await mockState();
+    if (process.env.FF_KEEP_HOME === "1") {
+      writeFileSync(path.join(home, "case8-turn2.log"), second.stdout);
+      writeFileSync(path.join(home, "case8-mock.json"), JSON.stringify(state, null, 2));
+      writeFileSync(
+        path.join(home, "case8-transcript.json"),
+        JSON.stringify(transcript(), null, 2),
+      );
+    }
+
+    assert.equal(
+      compactionRequests(state, "paid").length,
+      1,
+      `the compaction was served by the fallback route: ${JSON.stringify(
+        state.log.map((entry) => `${entry.role}:${entry.model}${entry.compaction ? "[c]" : ""}`),
+      )}`,
+    );
+    assert.equal(
+      compactionRequests(state, "free").length,
+      0,
+      "the compaction must not spend a free request while the cooldown is known",
+    );
+    assert.equal(
+      state.log.filter((entry) => entry.event === "error-response").length,
+      0,
+      "no free request was made that the known cooldown could have predicted",
+    );
+
+    const record = transcript();
+    assert.equal(
+      compactions(record).filter((message) => message.data.status === "failed").length,
+      0,
+      "no failed compaction",
+    );
+    assert.equal(
+      compactions(record).filter((message) => message.data.status === "completed").length,
+      1,
+      "exactly one completed compaction",
+    );
+    const switches = record.messages.filter((message) => message.type === "model-switched");
+    assert.equal(switches.length, 1, "one switch to the fallback, and no churn back");
+    assert.equal(
+      record.model.id,
+      "ff-paid",
+      "the session stays on the fallback while the cooldown lasts",
+    );
+    assert.match(second.stdout, /MOCK_OK model=ff-paid/);
+    offpeakConfig(undefined);
+  });
+
+  it("Case 9 — a genuine free limit discovered by a compaction fails over without burning more free requests", async () => {
+    // Required scenario 2: FREE believed healthy, the compaction tries FREE and
+    // discovers the limit. The failed compaction is acceptable here — that
+    // request *is* the discovery — but the attempt must not be retried on the
+    // free model, which cannot change its model, and the retried compaction must
+    // succeed on the fallback exactly once.
+    offpeakConfig(flatPolicy());
+    reset();
+    const first = await knownCooldownTurn({ freeMode: "ok" });
+    assert.equal(
+      first.state.log.every((entry) => entry.event !== "error-response"),
+      true,
+      "turn 1 ran entirely on the free model",
+    );
+
+    // Turn 2 compacts on the free model, which starts limiting right now.
+    await control({
+      log: [],
+      free: { mode: "429", failFirst: 1, retryAfterSeconds: 120, promptTokens: 190_000 },
+      paid: { mode: "ok", promptTokens: 190_000 },
+    });
+    const second = await run("Continue", ["--session", first.sessionID]);
+    const afterSecond = await mockState();
+    assert.equal(
+      compactionRequests(afterSecond, "free").length,
+      1,
+      "the compaction discovered the limit on the free model",
+    );
+    assert.equal(
+      afterSecond.log.filter((entry) => entry.event === "error-response").length,
+      1,
+      "the doomed free compaction was not retried",
+    );
+    assert.equal(
+      compactionRequests(afterSecond, "paid").length,
+      0,
+      "a cancelled-in-advance attempt does not dispatch on the fallback either",
+    );
+    void second;
+
+    // Turn 3: the session now runs on the fallback, so the compaction the failed
+    // turn could not finish succeeds there, exactly once.
+    await control({
+      log: [],
+      free: { mode: "429", failFirst: null, retryAfterSeconds: 120, promptTokens: 190_000 },
+      paid: { mode: "ok", promptTokens: 190_000 },
+    });
+    const third = await run("Continue", ["--session", first.sessionID]);
+    assertOk(third);
+    const state = await mockState();
+    assert.equal(
+      compactionRequests(state, "paid").length,
+      1,
+      "the retried compaction ran on the fallback",
+    );
+    assert.equal(
+      compactionRequests(state, "free").length,
+      0,
+      "the free model was never asked for a compaction again",
+    );
+    const record = transcript();
+    assert.equal(
+      compactions(record).filter((message) => message.data.status === "completed").length,
+      1,
+      "exactly one compaction completed across the whole case",
+    );
+    assert.match(third.stdout, /MOCK_OK model=ff-paid/);
+    offpeakConfig(undefined);
+  });
+
+  it("Case 10 — free-first works with no policy plugin installed at all", async () => {
+    // Independence: only the free-first entry is installed here. Nothing may
+    // depend on the neighbour being present.
+    writeConfig([{ package: repo, options: freeFirstOptions }]);
+    reset();
+    await control({
+      log: [],
+      // Every free request fails, so the only way this turn can answer is on
+      // the fallback — with no policy plugin installed to help.
+      free: { mode: "429", retryAfterSeconds: 30, promptTokens: 10 },
+      paid: { mode: "ok", promptTokens: 10 },
+    });
+    const result = await run("Reply with the word READY");
+    assertOk(result);
+    const state = await mockState();
+    assert.match(result.stdout, /MOCK_OK model=ff-paid/, "the same turn failed over on its own");
+    assert.equal(
+      models(state).filter((model) => model === "ff-paid").length > 0,
+      true,
+      "the fallback route was used without any policy plugin",
+    );
+    const record = transcript();
+    assert.equal(
+      record.messages.filter((message) => message.type === "user").length,
+      1,
+      "one user message",
+    );
+    assert.equal(record.session.idle_outcome, "succeeded");
+    writeConfig(coexistencePlugins);
+  });
+
+  it("Case 11 — offpeak works with no free-first plugin installed at all", async () => {
+    // Independence, the other way round: offpeak alone still prices paid work,
+    // and it knows nothing about the free model.
+    writeConfig([OFFPEAK_SPEC]);
+    reset();
+    offpeakConfig({
+      id: "ffmock-paid-peak",
+      providers: ["ffmock"],
+      models: ["ff-paid"],
+      flatModels: ["ff-free"],
+      timeZone: "UTC",
+      blocked: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "23:59" }],
+      multiplier: 2,
+      source: "integration test",
+    });
+
+    // `guard` mode blocks a peak interactive request instead of holding it, so
+    // the standalone behaviour is observable without waiting for a window.
+    writeJson(path.join(home, "config", "opencode", "offpeak.json"), {
+      schemaVersion: 1,
+      enabled: true,
+      mode: "guard",
+      displayTimeZone: "UTC",
+      policies: [
+        {
+          id: "ffmock-paid-peak",
+          providers: ["ffmock"],
+          models: ["ff-paid"],
+          flatModels: ["ff-free"],
+          timeZone: "UTC",
+          blocked: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "23:59" }],
+          multiplier: 2,
+          source: "integration test",
+        },
+      ],
+    });
+    await control({
+      log: [],
+      free: { mode: "ok", promptTokens: 10 },
+      paid: { mode: "ok", promptTokens: 10 },
+    });
+    const blocked = await run("Reply with the word READY", ["--model", "ffmock/ff-paid"]);
+    assert.notEqual(blocked.status, 0, "the peak window is enforced by offpeak alone");
+    assert.match(blocked.stdout, /pricing guard|peak/i);
+    assert.equal(
+      models(await mockState()).filter((model) => model === "ff-paid").length,
+      0,
+      "no paid request escaped the guard",
+    );
+
+    // With the paid route allowed, the same standalone plugin lets the turn run.
+    offpeakConfig({
+      id: "ffmock-flat",
+      providers: ["ffmock"],
+      models: ["ff-paid"],
+      flatModels: ["ff-free"],
+      timeZone: "UTC",
+      blocked: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "00:01" }],
+      multiplier: 2,
+      source: "integration test",
+    });
+    const allowed = await run("Reply with the word READY", ["--model", "ffmock/ff-paid"]);
+    assertOk(allowed);
+    assert.match(allowed.stdout, /MOCK_OK model=ff-paid/);
+    writeConfig(coexistencePlugins);
     offpeakConfig(undefined);
   });
 });

@@ -61,14 +61,21 @@ stays in charge of *when* paid work runs.
    settles free health before any session is moved. A probe that is rate limited
    changes nothing for a productive fallback session; a probe that merely fails is
    treated as *unknown*, so it can never keep the free model blocked.
-8. **Reclaims parked paid work without interrupting the session.** If another
+8. **Never spends a request the cooldown already predicted.** While a cooldown is
+   active, the sessions that can reach a step boundary without another hook —
+   those with an active execution — are kept on the fallback, because that
+   boundary is where OpenCode resolves an automatic compaction's model and a
+   prepared compaction cannot change it on retry. A compaction that *discovers*
+   a limit is still allowed to fail once: that request is the discovery. Idle
+   sessions are left alone; prompt admission and request preparation route them.
+9. **Reclaims parked paid work without interrupting the session.** If another
    plugin holds the fallback request (for example an off-peak pricing policy) and
    the free model recovers first, the plugin cancels the obsolete paid attempt
    through the parking plugin's generic hold cancellation, and the same
    execution continues on the free model. The held request is refused at the
    transport boundary, so it is never sent, no continuation input is admitted,
    and a headless `opencode run` stays attached until the task finishes.
-9. **Respects explicit model choices.** A manual change to an unrelated model —
+10. **Respects explicit model choices.** A manual change to an unrelated model —
    or to the paid route — stops free-first from managing that session.
 
 ## What it does not do
@@ -159,6 +166,9 @@ Two ordering facts matter, and both are verified by the live coexistence suite
 - Free-first's `retry` hook must run **after** any plugin that can veto a retry,
   so list `opencode-free-first` **after** `opencode-offpeak`. The plugin logs a
   transition either way, but the failover retry needs the last word.
+- A cancelled paid compaction is never re-sent: a compaction retry re-sends its
+  own resolved model, so the reclaim ends that attempt and resumes the turn on
+  the free model instead of dispatching the paid request it just cancelled.
 - Free-first never delays, queues, or prices paid work. When the fallback route
   is peak-priced it is held by the policy plugin, the session is parked, and
   free-first reclaims it only after the free model is confirmed healthy — by
@@ -249,7 +259,7 @@ cache reasons.
 Read the live state through the plugin RPC:
 
 ```sh
-opencode api post /api/rpc/opencode-free-first/control --data '{"action":"status"}'
+opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"status"}}'
 ```
 
 `status` returns:
@@ -309,7 +319,7 @@ cached package directory under `~/.cache/opencode/npm/`. OpenCode's plugin
 storage for this plugin can be cleared with:
 
 ```sh
-opencode api post /api/rpc/opencode-free-first/control --data '{"action":"off"}'
+opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"off"}}'
 ```
 
 and then removing the `plugin:<id>:opencode-free-first/*` rows OpenCode keeps.

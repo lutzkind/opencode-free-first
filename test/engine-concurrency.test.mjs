@@ -86,14 +86,28 @@ describe("concurrency", () => {
     assert.equal(switches.length, 1, "exactly one fallback -> free transition");
   });
 
-  it("handles one session failing over while another is healthy", async () => {
+  it("moves an executing session off the free model when another session discovers a limit", async () => {
+    // The cooldown is a property of the provider account, not of one session. A
+    // session that is mid-turn has no hook between its steps, and a step
+    // boundary is where an automatic compaction resolves its model — so it is
+    // moved to its fallback immediately. Idle sessions are left alone: their
+    // next activity goes through prompt admission or a request preparation, and
+    // both route them.
     const { engine, sessions } = await boot();
+    engine.onExecution({ sessionID: "ses_ok", phase: "started" });
     engine.onModelRequest("ses_ok", FREE, "primary");
+    engine.onModelRequest("ses_idle", FREE, "primary");
     engine.onModelRequest("ses_bad", FREE, "primary");
     await retry(engine, "ses_bad");
     assert.deepEqual(
       sessions.of("switchModel").map((call) => call.sessionID),
-      ["ses_bad"],
+      ["ses_bad", "ses_ok"],
+    );
+    assert.equal(engine.status().cooldownRouting?.runs, 1);
+    assert.equal(
+      engine.status().cooldownRouting?.routed,
+      1,
+      "the failing session moved with the failover",
     );
   });
 
