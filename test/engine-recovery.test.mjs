@@ -80,28 +80,81 @@ describe("recovery", () => {
     assert.ok(engine.status().cooldownMs > 0);
   });
 
-  it("treats an inconclusive probe as neither health nor exhaustion", async () => {
+  it("treats an inconclusive probe as unknown and returns the session to the free model", async () => {
     const generate = new FakeGenerate();
     generate.error = { type: "provider.internal", status: 500, message: "internal server error" };
     const { engine, clock, sessions, log } = await boot({ generate });
     await failover(engine, "ses_a");
     await clock.advance(1_500);
-    assert.equal(sessions.of("switchModel").length, 1);
+    // Fail open: a probe that cannot decide must never keep the free model
+    // blocked, or a probe that can never run would block it forever.
+    assert.equal(engine.status().state, "FREE_HEALTHY");
+    assert.equal(engine.status().cooldownMs, 0);
     assert.equal(engine.status().level, 1, "the ladder did not advance");
-    assert.ok(log.has("recovery probe inconclusive"));
-    assert.ok(engine.status().cooldownMs > 1_000, "a short retry was armed");
+    assert.deepEqual(
+      sessions.of("switchModel").map((call) => call.model.id),
+      ["fake-paid", "fake-free"],
+      "the session came back to the free model and real traffic decides",
+    );
+    assert.match(engine.status().lastProbeOutcome, /^inconclusive:/);
+    assert.ok(engine.status().probeBackoffUntil > clock.now(), "the next probe is scheduled");
+    assert.ok(log.has("recovery probe inconclusive; free model stays usable"));
   });
 
-  it("wakes up again after an inconclusive probe", async () => {
+  it("does not keep probing inside the back-off window", async () => {
+    const generate = new FakeGenerate();
+    generate.error = { type: "provider.internal", status: 500, message: "internal server error" };
+    const { engine, clock } = await boot({ generate });
+    await failover(engine, "ses_a");
+    await clock.advance(1_500);
+    assert.equal(generate.calls.length, 1);
+    // A new session arrives inside the back-off: no probe, and no fallback.
+    const sessions2 = new FakeGenerate();
+    void sessions2;
+    await engine.onPrompt("ses_b");
+    await clock.advance(1_000);
+    assert.equal(generate.calls.length, 1, "no extra probe inside the back-off");
+  });
+
+  it("probes again once the probe back-off has elapsed", async () => {
     const generate = new FakeGenerate();
     generate.error = { type: "provider.transport", message: "socket hang up" };
     const { engine, clock } = await boot({ generate });
     await failover(engine, "ses_a");
     await clock.advance(1_500);
-    const probes = generate.calls.length;
-    generate.error = undefined;
-    await clock.advance(61_000);
-    assert.ok(generate.calls.length > probes, "a later probe was attempted");
+    assert.equal(generate.calls.length, 1);
+    assert.ok(engine.status().probeBackoffUntil > clock.now(), "the back-off is armed");
+    // A second limit arrives, so a session is waiting on the fallback again.
+    await failover(engine, "ses_b");
+    // The probe back-off elapses at +2s and the new cooldown at +3.5s.
+    await clock.advance(4_000);
+    assert.equal(generate.calls.length, 2, "a later probe was attempted");
+    assert.equal(engine.status().state, "FREE_HEALTHY");
+  });
+
+  it("stops probing when the host refuses the probe path", async () => {
+    const generate = new FakeGenerate();
+    generate.error = {
+      tag: "Generate.UnavailableError",
+      message:
+        "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.",
+    };
+    const { engine, clock, sessions, log } = await boot({ generate });
+    await failover(engine, "ses_a");
+    await clock.advance(1_500);
+    assert.equal(generate.calls.length, 1);
+    assert.equal(engine.status().state, "FREE_HEALTHY", "the free model stays usable");
+    assert.ok(log.has("the recovery probe is not permitted for this model"));
+    assert.match(engine.status().lastProbeOutcome, /^unsupported:/);
+    // Far inside the (long) unsupported back-off, and after another failover.
+    await failover(engine, "ses_b");
+    await clock.advance(5_000);
+    assert.equal(generate.calls.length, 1, "the refused probe is not retried every cycle");
+    assert.equal(
+      sessions.of("switchModel").filter((call) => call.model.id === "fake-free").length,
+      2,
+      "both sessions returned to the free model",
+    );
   });
 
   it("runs recovery passively when probing is disabled", async () => {
@@ -128,7 +181,10 @@ describe("recovery", () => {
     await failover(engine, "ses_a");
     generate.error = new Error("network down");
     await clock.advance(1_500);
-    assert.equal(engine.status().state, "FREE_COOLDOWN");
+    // An unexplained probe failure is not a limit, so the free model stays
+    // usable and the next real request is the test.
+    assert.equal(engine.status().state, "FREE_HEALTHY");
+    assert.equal(engine.status().level, 1);
   });
 });
 

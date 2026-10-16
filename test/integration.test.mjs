@@ -95,6 +95,8 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
             jitterRatio: 0,
             failoverRetryDelayMs: 50,
             parkGraceMs: 1_200,
+            // A distinctive probe prompt lets the mock gate exactly the probe.
+            probePrompt: "FF_PROBE_PROBE_ONLY",
             logLevel: "debug",
           },
         },
@@ -128,12 +130,28 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     });
   }
 
-  /** Apply mock behaviour. Request counters always restart per scenario. */
+  /**
+   * Apply mock behaviour. Every role is reset to a known baseline first, and
+   * request counters always restart, so no scenario can leak into the next.
+   */
   async function control(patch) {
+    const baseline = {
+      mode: "ok",
+      failFirst: null,
+      body: undefined,
+      retryAfterSeconds: undefined,
+      delayMs: 0,
+      gateProbe: false,
+    };
     await fetch(`http://127.0.0.1:${port}/__control`, {
       method: "POST",
       headers: { "content-type": "application/json", connection: "close" },
-      body: JSON.stringify({ resetCounters: true, ...patch }),
+      body: JSON.stringify({
+        log: patch.log ?? [],
+        resetCounters: true,
+        free: { ...baseline, ...(patch.free ?? {}) },
+        paid: { ...baseline, ...(patch.paid ?? {}) },
+      }),
     });
   }
 
@@ -185,7 +203,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     reset();
     await control({
       log: [],
-      free: { mode: "ok", failFirst: null, retryAfterSeconds: undefined },
+      free: { mode: "ok" },
       paid: { mode: "ok" },
     });
     const result = await run("Reply with the word READY");
@@ -202,7 +220,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     reset();
     await control({
       log: [],
-      free: { mode: "429", failFirst: null, retryAfterSeconds: 2 },
+      free: { mode: "429", retryAfterSeconds: 2 },
       paid: { mode: "ok" },
     });
     const result = await run("Reply with the word READY");
@@ -231,7 +249,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     reset();
     await control({
       log: [],
-      free: { mode: "429", failFirst: null, retryAfterSeconds: 1 },
+      free: { mode: "429", retryAfterSeconds: 1 },
       paid: { mode: "ok" },
     });
     const result = await run("Reply with the word READY");
@@ -246,7 +264,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     reset();
     await control({
       log: [],
-      free: { mode: "429", failFirst: null, retryAfterSeconds: 1 },
+      free: { mode: "429", retryAfterSeconds: 1 },
       paid: { mode: "ok" },
     });
     const first = await run("Reply with the word READY");
@@ -277,6 +295,13 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       stdio: ["ignore", "pipe", "pipe"],
     });
     const auth = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+    let output = "";
+    child.stdout?.on("data", (chunk) => {
+      output += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      output += String(chunk);
+    });
     const call = async (method, route, body) => {
       const response = await fetch(`http://127.0.0.1:${apiPort}${route}`, {
         method,
@@ -305,7 +330,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
         }
       }
       assert.ok(ready, "opencode serve did not become ready");
-      return await fn({ call });
+      return await fn({ call, output: () => output });
     } finally {
       child.kill("SIGTERM");
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -397,6 +422,115 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     offpeakConfig(undefined);
   });
 
+  it("Case 7 — a host that refuses the recovery probe never blocks the free model", async () => {
+    // Regression for the 2026-10-16 live defect: OpenCode's free tier refuses
+    // the out-of-band probe path, so the probe can never succeed. An
+    // inconclusive probe must be treated as unknown, never as a limit, or every
+    // new session is routed to the fallback forever after the first limit.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      free: { mode: "429", retryAfterSeconds: 1, failFirst: 2, gateProbe: true },
+      paid: { mode: "ok" },
+    });
+
+    const project = path.join(home, "project");
+    const answerOf = (messages) =>
+      messages
+        .filter((message) => message.type === "assistant")
+        .flatMap((message) => message.content ?? [])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join(" ");
+    const answered = (messages) => /MOCK_OK/.test(answerOf(messages));
+
+    const outcome = await withServer(async ({ call, output }) => {
+      const start = async (title) => {
+        const created = await call("POST", "/api/session", {
+          title,
+          model: { providerID: "ffmock", id: "ff-free" },
+          location: { directory: project },
+        });
+        const sessionID = created?.data?.id ?? created?.id;
+        assert.ok(sessionID, `no session id: ${JSON.stringify(created)}`);
+        await call("POST", `/api/session/${sessionID}/prompt`, {
+          text: "Reply with the word READY",
+        });
+        let messages = [];
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const context = await call("GET", `/api/session/${sessionID}/context`);
+          messages = context?.data ?? [];
+          if (answered(messages)) break;
+        }
+        const session = (await call("GET", `/api/session/${sessionID}`))?.data;
+        return { sessionID, messages, session };
+      };
+
+      const first = await start("probe-gate");
+      // Wait for the cooldown to elapse and the probe to be attempted and
+      // refused. This is the decisive step: the probe must not be able to keep
+      // the free model blocked.
+      let probeRefused = false;
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const seen = await mockState();
+        if (seen.log.some((entry) => entry.event === "probe-refused")) {
+          probeRefused = true;
+          break;
+        }
+      }
+      // Give the engine a moment to run the fail-open recovery.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      const firstAfter = (await call("GET", `/api/session/${first.sessionID}`))?.data;
+      const second = await start("after-recovery");
+      return { first, firstAfter, second, probeRefused, log: output() };
+    });
+
+    const { log } = outcome;
+    assert.equal(outcome.probeRefused, true, "the probe was attempted and refused");
+    assert.match(log, /free rate limit detected/);
+    assert.match(
+      log,
+      /the recovery probe is not permitted for this model/,
+      "the refused probe path was recognised",
+    );
+    assert.equal(
+      outcome.firstAfter?.model?.id,
+      "ff-free",
+      "the first session was returned to the free model after the refused probe",
+    );
+    assert.equal(
+      outcome.first.messages.filter((message) => message.type === "user").length,
+      1,
+      "the prompt was never duplicated",
+    );
+
+    // The free model stays the normal route: a second session is not downgraded.
+    assert.match(
+      answerOf(outcome.second.messages),
+      /MOCK_OK model=ff-free/,
+      "the second task finished on the free model",
+    );
+    assert.equal(outcome.second.session?.model?.id, "ff-free");
+    assert.doesNotMatch(log, /prompt-admission/);
+
+    const state = await mockState();
+    assert.ok(
+      state.log.some((entry) => entry.event === "probe-refused"),
+      "the host refused the probe",
+    );
+    assert.equal(
+      state.log.filter((entry) => entry.event === "error-response").length,
+      1,
+      "the free tier limited exactly the configured attempt",
+    );
+    assert.ok(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "free").length >= 3,
+      "the free model was used again after the cooldown",
+    );
+  });
+
   it("Case 3 — a parked paid fallback is reclaimed for the free model", async () => {
     // The paid route is peak-priced for the whole test window and the free
     // route is declared flat and never delayed, so opencode-offpeak holds paid
@@ -439,6 +573,24 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     assert.match(result.stdout, /parked fallback request detected/);
     assert.match(result.stdout, /stale fallback continuation neutralized/);
     assert.match(result.stdout, /duplicate continuation prevented/);
+    // The same session is put back on the free model, so the task continues on
+    // the free route rather than waiting out the peak window.
+    assert.match(result.stdout, /trigger: "park-preemption"/);
+    assert.match(result.stdout, /returned to free model/);
+
+    // Known headless limitation, reported as ARCHITECTURE CHANGE PROPOSED in
+    // HANDOFF.md. `opencode run` treats any `session.execution.interrupted`
+    // event as the end of the run (OpenCode 2.0.30, headless runner), and
+    // cancelling a held fallback request requires an interruption. The session,
+    // model, and continuation are already correct — a live `opencode serve`
+    // completes the resumed turn, which case 3b proves. If the host ever keeps
+    // the headless client attached, this assertion must be updated to require
+    // the resumed answer.
+    assert.equal(
+      result.stdout.includes("MOCK_OK model=ff-free"),
+      false,
+      "headless client exited before the resumed step; see the park-reclamation proposal",
+    );
     // The resumed turn asks the free model again, and that request succeeds:
     // the task continues on the free route with no paid work ever dispatched.
     const freeRequests = state.log.filter(

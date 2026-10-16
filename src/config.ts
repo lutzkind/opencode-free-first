@@ -53,6 +53,12 @@ export interface FreeFirstConfig {
   /** Probe request budget. */
   readonly probePrompt: string;
   readonly probeMaxTokens: number;
+  /**
+   * How long to stop probing after the host refuses the probe path itself.
+   * Retrying a structurally refused request every minute is pointless, and
+   * passive recovery already covers the case.
+   */
+  readonly probeUnsupportedBackoffMs: number;
   /** How long a prepared-but-undispatched request counts as parked. */
   readonly parkGraceMs: number;
   /** Window in which a model selection is attributed to this plugin. */
@@ -91,6 +97,7 @@ export const DEFAULT_CONFIG: FreeFirstConfig = {
   duplicateLimitWindowMs: 5_000,
   probePrompt: "Reply with the single word: pong",
   probeMaxTokens: 8,
+  probeUnsupportedBackoffMs: 21_600_000,
   parkGraceMs: 5_000,
   switchConfirmMs: 10_000,
   continuationText: DEFAULT_CONTINUATION_TEXT,
@@ -249,6 +256,16 @@ function buildConfig(raw: Record<string, unknown>): FreeFirstConfig {
     600_000,
   );
   if (duplicateLimitWindowMs !== undefined) config.duplicateLimitWindowMs = duplicateLimitWindowMs;
+
+  const probeUnsupportedBackoffMs = boundedNumber(
+    raw.probeUnsupportedBackoffMs,
+    "probeUnsupportedBackoffMs",
+    60_000,
+    86_400_000,
+  );
+  if (probeUnsupportedBackoffMs !== undefined) {
+    config.probeUnsupportedBackoffMs = probeUnsupportedBackoffMs;
+  }
 
   const parkGraceMs = boundedNumber(raw.parkGraceMs, "parkGraceMs", 500, 600_000);
   if (parkGraceMs !== undefined) config.parkGraceMs = parkGraceMs;

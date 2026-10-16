@@ -13,20 +13,23 @@
  * tests with no provider traffic.
  */
 
-import type { ProviderErrorView, ResetHint } from "./classify.js";
-import { classifyFreeLimit, extractReset } from "./classify.js";
+import type { ProbeOutcome, ProviderErrorView, ResetHint } from "./classify.js";
+import { classifyFreeLimit, classifyProbeFailure, extractReset } from "./classify.js";
 import type { FreeFirstConfig } from "./config.js";
 import {
   applyLimited,
+  backoffFor,
+  clearElapsedCooldown,
   cooldownElapsed,
   decodeHealth,
-  deferAfterInconclusiveProbe,
   extendCooldown,
   formatDuration,
   healthState,
   inCooldown,
   initialHealth,
   markHealthy,
+  markProbeInconclusive,
+  probeDeferred,
   remainingCooldown,
 } from "./health.js";
 import type { Logger } from "./log.js";
@@ -136,6 +139,9 @@ export interface EngineStatus {
   readonly lastResetSource?: string;
   readonly lastHealthyAt?: number;
   readonly probedAt?: number;
+  readonly probeBackoffUntil?: number;
+  readonly inconclusiveProbes?: number;
+  readonly lastProbeOutcome?: string;
   readonly managedSessions: number;
   readonly fallbackSessions: number;
   readonly managedSessionIds: readonly string[];
@@ -159,7 +165,6 @@ interface PrepareMark {
 }
 
 const MAX_TRANSITIONS = 40;
-const INCONCLUSIVE_PROBE_RETRY_MS = 60_000;
 /** Upper bound on waiting for a preempted session to settle. */
 const PARK_SETTLE_TIMEOUT_MS = 15_000;
 
@@ -195,7 +200,7 @@ export class FreeFirstEngine {
   #timer: unknown;
   #timerDueAt: number | undefined;
   #flushTimer: unknown;
-  #probe: Promise<boolean> | undefined;
+  #probe: Promise<ProbeOutcome> | undefined;
   #probedAt: number | undefined;
   #defaultModel: ModelRef | undefined;
   #disposed = false;
@@ -635,6 +640,11 @@ export class FreeFirstEngine {
   /** Clear any cooldown because an operator says the limit is lifted. */
   markHealthy(reason: string): void {
     this.#notePrimarySuccess(reason);
+    const cleared = { ...this.#health };
+    cleared.probeBackoffUntil = undefined;
+    cleared.inconclusiveProbes = 0;
+    cleared.lastProbeOutcome = undefined;
+    this.#health = cleared;
     this.#markDirty();
     this.#schedule();
   }
@@ -704,6 +714,13 @@ export class FreeFirstEngine {
         ? {}
         : { lastHealthyAt: this.#health.lastHealthyAt }),
       ...(this.#probedAt === undefined ? {} : { probedAt: this.#probedAt }),
+      ...(this.#health.probeBackoffUntil === undefined
+        ? {}
+        : { probeBackoffUntil: this.#health.probeBackoffUntil }),
+      inconclusiveProbes: this.#health.inconclusiveProbes ?? 0,
+      ...(this.#health.lastProbeOutcome === undefined
+        ? {}
+        : { lastProbeOutcome: this.#health.lastProbeOutcome }),
       managedSessions: this.#sessionsState.size,
       managedSessionIds: [...this.#sessionsState.keys()],
       fallbackSessions: fallbackSessionIds.length,
@@ -953,7 +970,8 @@ export class FreeFirstEngine {
     // A recovery this instance already confirmed is newer than the stored limit:
     // there is nothing left to adopt, and pulling the ladder back up would undo a
     // successful recovery.
-    const ourRecoveryAt = this.#health.state === "FREE_HEALTHY" ? (this.#health.lastHealthyAt ?? 0) : 0;
+    const ourRecoveryAt =
+      this.#health.state === "FREE_HEALTHY" ? (this.#health.lastHealthyAt ?? 0) : 0;
     if (ourRecoveryAt > (stored.lastRateLimitAt ?? 0)) return;
     if (!newer && !longer) return;
     this.#health = {
@@ -1091,6 +1109,16 @@ export class FreeFirstEngine {
     if (this.#health.state === "FREE_COOLDOWN" && this.#health.cooldownUntil !== undefined) {
       consider(this.#health.cooldownUntil + 1);
     }
+    // A probe back-off is only worth waking for when a session is waiting on the
+    // fallback and the probe could actually tell us something.
+    if (
+      this.#config.probe &&
+      this.#health.probeBackoffUntil !== undefined &&
+      !this.#inCooldown() &&
+      this.#fallbackSessions().length > 0
+    ) {
+      consider(this.#health.probeBackoffUntil + 1);
+    }
     if (this.#config.parkPreemption && this.#health.state === "FREE_HEALTHY") {
       for (const [sessionID, mark] of this.#prepared) {
         if (mark.dispatched) continue;
@@ -1161,19 +1189,29 @@ export class FreeFirstEngine {
       });
       const probe = this.#runProbe();
       this.#probe = probe;
-      let healthy = false;
+      let outcome: ProbeOutcome = "inconclusive";
       try {
-        healthy = await probe;
+        outcome = await probe;
       } finally {
         this.#probe = undefined;
       }
-      if (healthy) {
-        // Reclaim parked work while the sessions are still on the fallback, so
-        // the preemption can see which ones were waiting on paid capacity.
-        await this.#preemptParkedSessions();
-        for (const sessionID of this.#fallbackSessions()) {
-          await this.#upgrade(sessionID, "probe-recovery");
-        }
+      if (outcome === "limited") {
+        // A real limit: the fallback keeps owning the work until the new
+        // cooldown elapses. Nothing moves.
+        this.#schedule();
+        return;
+      }
+      // `healthy` and `inconclusive` both fail open. An inconclusive probe only
+      // tells us the probe could not decide, so the next real model call is the
+      // test — otherwise a probe that can never run would keep the free model
+      // blocked forever, which is exactly the defect this guards against.
+      this.#normaliseElapsedCooldown();
+      await this.#preemptParkedSessions();
+      for (const sessionID of this.#fallbackSessions()) {
+        await this.#upgrade(
+          sessionID,
+          outcome === "healthy" ? "probe-recovery" : "passive-recovery",
+        );
       }
       this.#schedule();
       return;
@@ -1189,6 +1227,18 @@ export class FreeFirstEngine {
     this.#schedule();
   }
 
+  /**
+   * Drop an elapsed cooldown from the record. Called on every fail-open outcome
+   * so a cooldown that has already passed can neither keep reporting as active
+   * nor keep waking the scheduler for a boundary that is behind us.
+   */
+  #normaliseElapsedCooldown(): void {
+    const next = clearElapsedCooldown(this.#health, this.#clock.now());
+    if (next === this.#health) return;
+    this.#health = next;
+    this.#markDirty();
+  }
+
   #fallbackSessions(): string[] {
     const out: string[] = [];
     for (const [sessionID, state] of this.#sessionsState) {
@@ -1202,14 +1252,27 @@ export class FreeFirstEngine {
    * generation runs without a session, without tools, and without touching any
    * session history, so a probe cannot pollute the user's conversation or cause
    * a business side effect. Probes are serialized and never run while the free
-   * model is in cooldown.
+   * model is in cooldown or inside a probe back-off.
+   *
+   * The returned outcome is what the caller acts on. Crucially, `inconclusive`
+   * means *unknown*, so it never keeps the free model blocked: a probe that
+   * cannot run is not evidence that the free model is unusable.
    */
-  async #runProbe(): Promise<boolean> {
+  async #runProbe(): Promise<ProbeOutcome> {
     await this.#adoptPersistedCooldown();
     const now = this.#clock.now();
     if (inCooldown(this.#health, now)) {
       this.#log("info", "another free-first instance already holds a cooldown; skipping the probe");
-      return false;
+      return "inconclusive";
+    }
+    if (probeDeferred(this.#health, now)) {
+      if (this.#logger.enabled("debug")) {
+        this.#log("debug", "recovery probe is inside its back-off; skipping", {
+          retryIn: formatDuration((this.#health.probeBackoffUntil ?? now) - now),
+        });
+      }
+      this.#normaliseElapsedCooldown();
+      return "inconclusive";
     }
     this.#log("info", "recovery probe started", { model: modelRefKey(this.#config.primary) });
     this.#onProbeState(true);
@@ -1225,38 +1288,66 @@ export class FreeFirstEngine {
         model: modelRefKey(this.#config.primary),
         took: formatDuration(at - now),
       });
-      return true;
+      return "healthy";
     } catch (error) {
       const view = toProviderErrorView(error);
-      const classification = classifyFreeLimit(view);
       const at = this.#clock.now();
       this.#probedAt = at;
-      if (classification.limited) {
+      const outcome = classifyProbeFailure(view);
+      const classification = classifyFreeLimit(view).reason;
+
+      if (outcome === "limited") {
         const reset = extractReset({ now: at, body: view.response?.body, message: view.message });
         const applied = extendCooldown(this.#health, {
           now: at,
           ...(reset === undefined ? {} : { reset }),
-          reason: `probe-${classification.reason}`,
+          reason: `probe-${classification}`,
           options: this.#config,
           random: this.#random,
         });
         this.#health = applied.health;
         this.#markDirty();
         this.#log("info", "recovery probe rate-limited", {
-          classification: classification.reason,
+          classification,
           resetSource: applied.source,
           cooldown: formatDuration(applied.cooldownMs),
           level: this.#health.level,
         });
-        return false;
+        return "limited";
       }
-      this.#health = deferAfterInconclusiveProbe(this.#health, at, INCONCLUSIVE_PROBE_RETRY_MS);
-      this.#markDirty();
-      this.#log("error", "recovery probe inconclusive; free health unchanged", {
-        type: view.type ?? "unknown",
-        classification: classification.reason,
+
+      // Not a limit: fail open and schedule the next attempt on the probe
+      // back-off ladder. An unsupported probe path backs off hard and says so,
+      // because retrying a structurally refused request every minute is futile.
+      const attempts = this.#health.inconclusiveProbes ?? 0;
+      const retryMs =
+        outcome === "unsupported"
+          ? this.#config.probeUnsupportedBackoffMs
+          : Math.min(backoffFor(attempts, this.#config.backoffMs), this.#config.maxCooldownMs);
+      this.#health = markProbeInconclusive(this.#health, {
+        now: at,
+        retryMs,
+        outcome: `${outcome}:${classification}`,
       });
-      return false;
+      this.#markDirty();
+      if (outcome === "unsupported" && attempts === 0) {
+        this.#log(
+          "error",
+          "the recovery probe is not permitted for this model; using passive recovery",
+          {
+            type: view.type ?? view.tag ?? "unknown",
+            classification,
+            nextProbeIn: formatDuration(retryMs),
+          },
+        );
+      } else {
+        this.#log("error", "recovery probe inconclusive; free model stays usable", {
+          type: view.type ?? view.tag ?? "unknown",
+          classification,
+          nextProbeIn: formatDuration(retryMs),
+        });
+      }
+      return outcome;
     } finally {
       this.#onProbeState(false);
     }
@@ -1370,6 +1461,9 @@ export function toProviderErrorView(error: unknown): ProviderErrorView {
   }
   return {
     ...(typeof record.type === "string" ? { type: record.type } : {}),
+    // OpenCode's own discriminant, kept for diagnostics and for recognising a
+    // probe path the host refuses (for example `Generate.UnavailableError`).
+    ...(typeof record._tag === "string" ? { tag: record._tag } : {}),
     ...(typeof record.message === "string" ? { message: record.message } : {}),
     ...(typeof record.status === "number" ? { status: record.status } : {}),
     ...(body === undefined ? {} : { response: { body } }),

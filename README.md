@@ -58,8 +58,9 @@ stays in charge of *when* paid work runs.
 6. **Backs off when the reset time is unknown.** A bounded ladder
    (1m, 2m, 5m, 10m, 15m, 15m, …) with bounded jitter, all of it configurable.
 7. **Recovers without thrash.** At cooldown expiry one tiny out-of-band request
-   settles free health before any session is moved. A failed probe changes
-   nothing for a productive fallback session.
+   settles free health before any session is moved. A probe that is rate limited
+   changes nothing for a productive fallback session; a probe that merely fails is
+   treated as *unknown*, so it can never keep the free model blocked.
 8. **Reclaims parked paid work.** If another plugin holds the fallback request
    (for example an off-peak pricing policy), and the free model recovers first,
    the plugin cancels the obsolete paid attempt, neutralises the parking
@@ -89,7 +90,7 @@ OpenCode v2 accepts npm-compatible package specifications, including Git URLs
 and exact tags. Install the published release:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.4
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.5
 opencode plugin list
 ```
 
@@ -226,9 +227,16 @@ cache reasons.
   at most one probe is ever in flight. Set `"session"` if evidence shows your
   provider limits per session.
 - **Probes need a usable route.** The probe uses the real configured free model
-  through OpenCode's normal routing. If that route is misconfigured the probe is
-  reported as inconclusive and the cooldown is re-armed briefly; the failure is
-  logged and never hidden.
+  through OpenCode's normal routing. If the host refuses that path — OpenCode's own
+  free tier does, because transient generation is not the agent loop — the refusal
+  is logged at `error`, the probe backs off hard (`probeUnsupportedBackoffMs`,
+  default 6h), and recovery switches to the passive path below. An inconclusive
+  probe is *unknown*, never *limited*: it never blocks the free model, because a
+  probe that cannot run is not evidence that the free model is unusable.
+- **Passive recovery is the safety net.** When probing is disabled, deferred, or
+  refused, the next real model call is the test: waiting sessions are returned to
+  the free model at their next boundary, and a genuine limit simply re-establishes
+  a real cooldown.
 
 ## Diagnostics
 
@@ -250,6 +258,8 @@ opencode api post /api/rpc/opencode-free-first/control --data '{"action":"status
 | `lastRateLimitAt` / `lastRateLimitType` | when and why the last limit was seen |
 | `lastResetSource` | `retry-after`, `retry-after-ms`, `x-ratelimit-reset`, `reset-timestamp`, or `backoff` |
 | `nextProbeAt` | when the next probe is due |
+| `probeBackoffUntil` / `inconclusiveProbes` | probe back-off and how many probes failed to decide |
+| `lastProbeOutcome` | `healthy`, `limited`, `unsupported`, or `inconclusive`, with the classification |
 | `probedAt` / `lastHealthyAt` | the last probe and the last confirmed recovery |
 | `managedSessions` / `fallbackSessions` | how many sessions are managed, and how many are on the fallback |
 | `manualOverrides` | sessions the user explicitly repointed |

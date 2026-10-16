@@ -1,12 +1,14 @@
 export type {
   Classification,
   FreeLimitKind,
+  ProbeOutcome,
   ProviderErrorView,
   ResetContext,
   ResetHint,
 } from "./classify.js";
 export {
   classifyFreeLimit,
+  classifyProbeFailure,
   extractReset,
   parseDelay,
   parseMilliseconds,
@@ -44,15 +46,17 @@ export type { HealthOptions, LimitedInput } from "./health.js";
 export {
   applyLimited,
   backoffFor,
+  clearElapsedCooldown,
   cooldownElapsed,
   decodeHealth,
-  deferAfterInconclusiveProbe,
   extendCooldown,
   formatDuration,
   healthState,
   inCooldown,
   initialHealth,
   markHealthy,
+  markProbeInconclusive,
+  probeDeferred,
   remainingCooldown,
   withJitter,
 } from "./health.js";

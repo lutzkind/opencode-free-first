@@ -125,6 +125,7 @@ cannot move a session the user repointed while OpenCode was stopped.
 | `model.transform` | Publish the free model as the default selection, capture each model's variant ids, capture OpenCode's own default before overriding it. |
 | `prompt` | Last point before a turn resolves its model: converge routing without spending a request on a model known to be cooling down. |
 | `context` | Observe request preparation (the park signal), and route a fallback session back to the free model when the cooldown has elapsed. |
+| `generate` | Bound the recovery probe's output. The probe is best-effort: only a real rate limit may block the free model. |
 | `model.request` | Confirm a request is about to be dispatched — the request is no longer held. |
 | `http.response` | Prove free health from a non-error response; capture reset headers. |
 | `retry` | The failover decision: record the cooldown, switch the model, force one cheap retry. |
@@ -183,14 +184,28 @@ cooldown expires
       ├── managed sessions waiting on the fallback and probing enabled
       │        │
       │        ├── one out-of-band probe via ctx.generate.text
-      │        │       ├── success  → reclaim parked work, then return every
-      │        │       │              waiting session to the free model
-      │        │       ├── 429      → cooldown extended, level + 1, sessions untouched
-      │        │       └── other    → inconclusive: short retry, level kept, sessions untouched
+      │        │       ├── success      → reclaim parked work, then return every
+      │        │       │                  waiting session to the free model
+      │        │       ├── rate limited → real cooldown extended, level + 1,
+      │        │       │                  sessions untouched
+      │        │       ├── unsupported  → the host refuses the probe path: log it,
+      │        │       │                  back off hard, fail open
+      │        │       └── inconclusive → unknown: short probe back-off, fail open
       │        │
-      └── nothing waiting, or probing disabled
+      └── nothing waiting, probing disabled, deferred, or refused
                └── passive: the next real model call is the test
 ```
+
+An inconclusive or refused probe is *unknown*, never *limited*, so it can never
+keep the free model blocked. It re-arms only the **probe** (`probeBackoffUntil`)
+and returns the waiting sessions to the free model. This is a hard invariant: a
+probe that cannot run must not decide that the free model is unusable, and a
+blocking cooldown armed by an unfinishable probe would route every new session to
+the fallback indefinitely.
+
+`OpenCode`'s own free tier refuses the probe path outright
+(`Generate.UnavailableError`: transient generation is not the agent loop), which is
+why the passive path is the load-bearing one in that configuration.
 
 The probe is a single serialized request. Concurrent triggers join the in-flight
 probe, so a herd of sessions reaching cooldown expiry together produces exactly

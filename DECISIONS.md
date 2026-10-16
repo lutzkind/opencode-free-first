@@ -129,6 +129,55 @@ A restored cooldown that has already elapsed is discarded, not replayed, and no
 probe is issued merely because OpenCode restarted. The first real request decides.
 This keeps a restart from spending free-tier quota on housekeeping.
 
+## 018 — An inconclusive probe is *unknown*, never *limited*
+
+A probe that cannot decide must fail open. Treating it as a limit arms a blocking
+cooldown on no evidence, and because the probe is retried on every cycle the block
+becomes permanent: on 2026-10-16 every new session was routed to the fallback for
+hours after the authoritative free-tier reset had passed, because the probe path is
+refused by OpenCode's own free tier and the inconclusive branch kept re-arming a
+60-second cooldown. An inconclusive probe now only schedules the next probe and
+returns the waiting sessions to the free model, so the next real model call is the
+test. A genuine limit still arms a real cooldown, so nothing is lost.
+
+## 019 — A refused probe path is distinguished from an unknown failure
+
+`Generate.UnavailableError` ("OpenCode's free tier can only be used from within
+OpenCode") means the probe *mechanism* is refused, not that the model is limited.
+Retrying it every minute is pointless, so it is recognised explicitly, logged once
+at `error` with the exact reason, and backed off for `probeUnsupportedBackoffMs`
+(6h by default) while recovery continues passively. Structural refusals
+(`invalid-request`, `no-route`, `auth`, `unsupported-operation`) get the same
+treatment; transient failures keep the ordinary ladder.
+
+## 020 — An elapsed cooldown leaves the record
+
+A cooldown whose timestamp has passed must not stay in the state document: it makes
+`status` report `FREE_PROBE` and keeps waking the scheduler for a boundary already
+behind it. Every fail-open outcome normalises the record to `FREE_HEALTHY` while
+preserving the ladder position and the probe bookkeeping.
+
+## 021 — A new limit keeps the probe verdict
+
+Whether the probe path works is a property of the host and the model route, not of
+the current rate-limit window, so `applyLimited` carries the probe back-off and
+attempt count forward. Otherwise a structurally refused probe would be retried once
+per limit cycle forever.
+
+## 022 — Park reclamation cannot be make headless-safe without an architecture change
+
+`opencode run` ends its stream loop unconditionally on
+`session.execution.interrupted` (verified in OpenCode 2.0.30), and cancelling a
+fallback request held inside another plugin's pre-model hook requires an
+interruption. So the same session, model, and invisible continuation are correct,
+but the headless client exits before the resumed step completes — a live
+`opencode serve` (the TUI's transport) completes it, which the integration suite
+proves. Making the headless client stay attached would require changing OpenCode's
+headless client, changing the parking plugin, or introducing a wrapper/daemon; all
+three are outside the approved architecture, so it is reported as
+`ARCHITECTURE CHANGE PROPOSED — USER APPROVAL REQUIRED` rather than changed
+silently.
+
 ## 017 — No paid traffic to keep a cache warm
 
 There is no evidence that warming the paid fallback's prompt cache pays for the

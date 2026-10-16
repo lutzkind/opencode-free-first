@@ -3,6 +3,47 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] — 2026-10-16
+
+### Fixed
+
+- **An inconclusive recovery probe no longer keeps the free model blocked.** An
+  inconclusive probe means *unknown*, never *limited*, so it now leaves the free
+  model usable and lets the next real model call decide. Previously it re-armed a
+  short blocking cooldown every time, which meant that once a probe could not
+  succeed, new sessions were routed to the fallback forever — even hours after an
+  authoritative reset had passed. This is the live defect fixed in this release.
+- **The recovery probe distinguishes a refused probe path from an unknown
+  failure.** OpenCode's own free tier refuses the out-of-band probe
+  (`Generate.UnavailableError`, "OpenCode's free tier can only be used from within
+  OpenCode") because transient generation is not the agent loop. That is logged at
+  `error` with an actionable message, backs the probe off hard
+  (`probeUnsupportedBackoffMs`, default 6h) instead of retrying a structurally
+  refused request every minute, and switches to passive recovery.
+- **An elapsed cooldown is dropped from the record.** A cooldown whose timestamp
+  has passed could stay in the state document, which made `status` report
+  `FREE_PROBE` and kept waking the scheduler for a boundary already behind it.
+  It is now normalised away on every fail-open outcome.
+- **A genuine limit keeps the probe verdict.** A new rate limit says nothing new
+  about whether the probe path works, so the probe back-off and attempt count
+  survive it instead of being reset on every cycle.
+- `classifyFreeLimit` reports `unclassified-message` instead of the misleading
+  `no-signal` when a provider message was present but matched nothing.
+
+### Added
+
+- `probeUnsupportedBackoffMs` configuration (default 21600000, 6h).
+- `status()` fields `probeBackoffUntil`, `inconclusiveProbes`, and
+  `lastProbeOutcome`, so diagnostics show why probing stopped.
+- Unit coverage for: an authoritative cooldown expiring while the process stays
+  alive; a refused probe path never blocking the free model; an elapsed cooldown
+  being dropped without a scheduler busy loop; a stale instance being unable to
+  resurrect an expired cooldown or overwrite a newer recovery; a newer real limit
+  replacing a healthy state; manual free-model selection after an expired cooldown
+  and during a valid one; and repeated cycles without transition churn.
+- An integration case that runs the real OpenCode CLI against a host that refuses
+  the probe path, proving the free model stays the normal route.
+
 ## [0.1.4] — 2026-10-15
 
 ### Fixed
@@ -111,6 +152,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.5]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.5
 [0.1.4]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.4
 [0.1.3]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.3
 [0.1.2]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.2

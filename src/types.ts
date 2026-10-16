@@ -47,13 +47,22 @@ export interface HealthRecord {
   readonly scope: string;
   readonly state: FreeState;
   /** Absolute epoch milliseconds. `undefined` when healthy. */
-  readonly cooldownUntil?: number;
+  readonly cooldownUntil?: number | undefined;
   /** Backoff ladder position, 0-based. */
   readonly level: number;
   readonly lastRateLimitAt?: number;
   readonly lastRateLimitType?: string;
   readonly lastResetSource?: ResetSource;
   readonly lastHealthyAt?: number;
+  /**
+   * Absolute time before which the recovery probe must stay quiet. A probe
+   * back-off never blocks the free model; it only schedules the next attempt.
+   */
+  readonly probeBackoffUntil?: number | undefined;
+  /** Consecutive inconclusive probes, used to escalate the probe back-off. */
+  readonly inconclusiveProbes?: number | undefined;
+  /** Why the last probe was inconclusive, for diagnostics. */
+  readonly lastProbeOutcome?: string | undefined;
 }
 
 export type ResetSource =

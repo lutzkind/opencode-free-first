@@ -22,10 +22,12 @@
 import type { ResetSource } from "./types.js";
 
 export interface ProviderErrorView {
-  readonly type?: string;
-  readonly message?: string;
-  readonly status?: number;
-  readonly response?: { readonly body?: string };
+  readonly type?: string | undefined;
+  /** OpenCode's internal discriminant, used for diagnostics only. */
+  readonly tag?: string | undefined;
+  readonly message?: string | undefined;
+  readonly status?: number | undefined;
+  readonly response?: { readonly body?: string } | undefined;
 }
 
 export type FreeLimitKind = "rate-limit" | "quota";
@@ -132,7 +134,51 @@ export function classifyFreeLimit(error: ProviderErrorView | undefined): Classif
       return { limited: true, kind: entry.kind, reason: `message-${entry.kind}` };
     }
   }
-  return { limited: false, reason: type === undefined ? "no-signal" : `unclassified-${type}` };
+  // The message was present but matched nothing: report that honestly rather
+  // than claiming there was no signal at all.
+  return {
+    limited: false,
+    reason: type === undefined ? "unclassified-message" : `unclassified-${type}`,
+  };
+}
+
+/**
+ * Outcome of an out-of-band recovery probe.
+ *
+ * - `limited` — the free model really is rate limited; block and back off.
+ * - `unsupported` — the probe mechanism itself is refused for this model (for
+ *   example OpenCode's free tier permits use only from its own agent loop).
+ *   Retrying the probe every minute is pointless, so it backs off hard.
+ * - `inconclusive` — anything else. Unknown, never *limited*: fail open and let
+ *   the next real request decide.
+ */
+export type ProbeOutcome = "healthy" | "limited" | "unsupported" | "inconclusive";
+
+const UNSUPPORTED_TYPES = new Set([
+  "provider.invalid-request",
+  "provider.auth",
+  "provider.no-route",
+  "provider.unsupported-operation",
+]);
+
+/**
+ * OpenCode's own gate on the free tier. The transient generation path is not
+ * the agent loop, so the gateway refuses it; that is a property of the probe,
+ * not of free-model health.
+ */
+const PROBE_PATH_REFUSED = /free tier can only be used from within opencode/i;
+
+export function classifyProbeFailure(error: ProviderErrorView | undefined): ProbeOutcome {
+  if (classifyFreeLimit(error).limited) return "limited";
+  if (error === undefined) return "inconclusive";
+  if (typeof error.message === "string" && PROBE_PATH_REFUSED.test(error.message)) {
+    return "unsupported";
+  }
+  if (typeof error.tag === "string" && /unavailable|unsupported/i.test(error.tag)) {
+    return "unsupported";
+  }
+  if (error.type !== undefined && UNSUPPORTED_TYPES.has(error.type)) return "unsupported";
+  return "inconclusive";
 }
 
 export interface ResetHint {

@@ -47,7 +47,7 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | `adoptFallbackSessions` | `false` | Also manage sessions whose model is the configured `fallback`, returning them to the free model when it is usable. Leave off unless you want free-first to move sessions you left on a paid route. |
 | `respectExplicitModelSelection` | `true` | Stop managing a session when you pick another model by hand. With `false`, a manual switch to the paid route keeps the session managed. |
 | `passiveRecovery` | `true` | Let the next real model call confirm recovery when probing is not used. |
-| `probe` | `true` | Issue one tiny out-of-band recovery probe at cooldown expiry. Alias: `recoveryProbe`. |
+| `probe` | `true` | Issue one tiny out-of-band recovery probe at cooldown expiry. Alias: `recoveryProbe`. A probe that cannot decide never blocks the free model; only a real rate limit does. |
 | `parkPreemption` | `true` | Reclaim a fallback request parked by another plugin's pre-model hold once the free model is confirmed healthy. |
 | `cooldownScope` | `"shared"` | `"shared"` keeps one cooldown for the whole OpenCode instance (a free tier is normally per account, and this also prevents probe storms). `"session"` limits per session. |
 | `sessionLimit` | `200` | Upper bound on remembered sessions; the least recently updated are evicted. |
@@ -65,6 +65,7 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | `switchConfirmMs` | `10000` | Window in which a model-selection event is attributed to this plugin rather than to the user. |
 | `probePrompt` | `"Reply with the single word: pong"` | The probe's prompt. Keep it tiny. |
 | `probeMaxTokens` | `8` | Output bound applied to the probe through the `generate` hook. |
+| `probeUnsupportedBackoffMs` | `21600000` (6h) | How long to stop probing after the host refuses the probe path itself (OpenCode's free tier does, with `Generate.UnavailableError`). Recovery continues passively in the meantime. |
 | `continuationText` | OpenCode's own interrupted-continuation sentence | The invisible continuation admitted when a parked task is reclaimed. |
 
 ## Logging
@@ -116,3 +117,7 @@ Logs never contain prompts, response bodies, header maps, or credentials.
 Recovery then happens passively: the next real model call after the cooldown
 expires is issued on the free model, and if it is still limited the session fails
 over again on the next ladder step.
+
+Note that even with `"probe": true` the plugin falls back to exactly this passive
+behaviour whenever a probe cannot decide — an inconclusive probe is never a reason
+to keep the free model blocked.

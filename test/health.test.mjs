@@ -3,15 +3,17 @@ import { describe, it } from "node:test";
 import {
   applyLimited,
   backoffFor,
+  clearElapsedCooldown,
   cooldownElapsed,
   decodeHealth,
-  deferAfterInconclusiveProbe,
   extendCooldown,
   formatDuration,
   healthState,
   inCooldown,
   initialHealth,
   markHealthy,
+  markProbeInconclusive,
+  probeDeferred,
   remainingCooldown,
   withJitter,
 } from "../dist/health.js";
@@ -146,12 +148,83 @@ describe("state transitions", () => {
     assert.ok(cooldownMs >= 1_000);
   });
 
-  it("treats an inconclusive probe as not-a-rate-limit", () => {
+  it("treats an inconclusive probe as unknown, never as a limit", () => {
     const { health } = limited(initialHealth(SCOPE, NOW));
-    const deferred = deferAfterInconclusiveProbe(health, NOW, 30_000);
-    assert.equal(deferred.state, "FREE_COOLDOWN");
+    const deferred = markProbeInconclusive(health, {
+      now: NOW,
+      retryMs: 30_000,
+      outcome: "inconclusive:unclassified-message",
+    });
+    // The free model stays usable: an inconclusive probe is not evidence of a
+    // limit, so it must never keep the free model blocked.
+    assert.equal(deferred.state, "FREE_HEALTHY");
+    assert.equal(deferred.cooldownUntil, undefined);
+    assert.equal(inCooldown(deferred, NOW), false);
     assert.equal(deferred.level, health.level, "the ladder does not advance");
-    assert.equal(deferred.cooldownUntil, NOW + 30_000);
+    assert.equal(deferred.probeBackoffUntil, NOW + 30_000);
+    assert.equal(deferred.inconclusiveProbes, 1);
+    assert.equal(probeDeferred(deferred, NOW), true);
+    assert.equal(probeDeferred(deferred, NOW + 30_001), false);
+    assert.equal(deferred.lastProbeOutcome, "inconclusive:unclassified-message");
+  });
+
+  it("keeps a probe back-off from ever becoming a routing block", () => {
+    let health = limited(initialHealth(SCOPE, NOW)).health;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      health = markProbeInconclusive(health, {
+        now: NOW + attempt * 100_000,
+        retryMs: 60_000,
+        outcome: "unsupported:unclassified-message",
+      });
+      assert.equal(inCooldown(health, NOW + attempt * 100_000), false, `attempt ${attempt}`);
+      assert.equal(health.state, "FREE_HEALTHY");
+    }
+    assert.equal(health.inconclusiveProbes, 5);
+  });
+
+  it("drops an elapsed cooldown from the record", () => {
+    const { health } = limited(initialHealth(SCOPE, NOW));
+    assert.equal(clearElapsedCooldown(health, NOW + 500).state, "FREE_COOLDOWN", "still blocking");
+    const cleared = clearElapsedCooldown(health, NOW + 1_000);
+    assert.equal(cleared.state, "FREE_HEALTHY");
+    assert.equal(cleared.cooldownUntil, undefined);
+    assert.equal(cleared.level, health.level, "the ladder survives");
+    assert.equal(inCooldown(cleared, NOW + 1_000), false);
+    assert.equal(healthState(cleared, NOW + 1_000), "FREE_HEALTHY");
+    // Idempotent, and a healthy record is returned untouched.
+    assert.equal(clearElapsedCooldown(cleared, NOW + 2_000), cleared);
+  });
+
+  it("keeps the probe bookkeeping when an elapsed cooldown is dropped", () => {
+    const deferred = markProbeInconclusive(limited(initialHealth(SCOPE, NOW)).health, {
+      now: NOW,
+      retryMs: 60_000,
+      outcome: "unsupported:unclassified-message",
+    });
+    const backToCooldown = applyLimited(deferred, {
+      now: NOW + 1_000,
+      reason: "again",
+      options: OPTIONS,
+      random: () => 0.5,
+    }).health;
+    assert.equal(backToCooldown.probeBackoffUntil, deferred.probeBackoffUntil);
+    const cleared = clearElapsedCooldown(backToCooldown, NOW + 10_000);
+    assert.equal(cleared.state, "FREE_HEALTHY");
+    assert.equal(cleared.probeBackoffUntil, deferred.probeBackoffUntil);
+    assert.equal(cleared.lastProbeOutcome, "unsupported:unclassified-message");
+  });
+
+  it("clears the probe back-off when health is confirmed", () => {
+    const deferred = markProbeInconclusive(limited(initialHealth(SCOPE, NOW)).health, {
+      now: NOW,
+      retryMs: 60_000,
+      outcome: "inconclusive",
+    });
+    const healthy = markHealthy(deferred, NOW + 1_000);
+    assert.equal(healthy.probeBackoffUntil, undefined);
+    assert.equal(healthy.inconclusiveProbes, 0);
+    assert.equal(healthy.lastProbeOutcome, undefined);
+    assert.equal(healthy.lastHealthyAt, NOW + 1_000);
   });
 });
 
@@ -162,6 +235,36 @@ describe("persistence", () => {
     });
     const decoded = decodeHealth(JSON.parse(JSON.stringify(health)), SCOPE);
     assert.deepEqual(decoded, health);
+  });
+
+  it("round-trips the probe back-off bookkeeping", () => {
+    const deferred = markProbeInconclusive(limited(initialHealth(SCOPE, NOW)).health, {
+      now: NOW,
+      retryMs: 120_000,
+      outcome: "unsupported:unclassified-message",
+    });
+    const decoded = decodeHealth(JSON.parse(JSON.stringify(deferred)), SCOPE);
+    assert.deepEqual(decoded, deferred);
+  });
+
+  it("drops corrupt probe bookkeeping without losing the cooldown", () => {
+    const base = limited(initialHealth(SCOPE, NOW)).health;
+    // Probe bookkeeping cannot affect routing safety, so a damaged value is
+    // dropped rather than discarding a real cooldown along with it.
+    for (const damaged of [
+      { probeBackoffUntil: -5 },
+      { probeBackoffUntil: "soon" },
+      { inconclusiveProbes: -1 },
+      { inconclusiveProbes: "many" },
+      { lastProbeOutcome: 42 },
+    ]) {
+      const decoded = decodeHealth({ ...base, ...damaged }, SCOPE);
+      assert.equal(decoded.state, "FREE_COOLDOWN", JSON.stringify(damaged));
+      assert.equal(decoded.cooldownUntil, base.cooldownUntil, JSON.stringify(damaged));
+      assert.equal(decoded.probeBackoffUntil, undefined, JSON.stringify(damaged));
+      assert.equal(decoded.inconclusiveProbes, undefined, JSON.stringify(damaged));
+      assert.equal(decoded.lastProbeOutcome, undefined, JSON.stringify(damaged));
+    }
   });
 
   it("discards state for another scope", () => {

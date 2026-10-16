@@ -195,8 +195,10 @@ describe("failure safety", () => {
     engine.onModelRequest("ses_a", FREE, "primary");
     await retry(engine, "ses_a");
     await clock.advance(1_500);
-    assert.equal(engine.status().state, "FREE_COOLDOWN");
+    // Fail open: an unexplained probe failure is unknown, not a limit.
+    assert.equal(engine.status().state, "FREE_HEALTHY");
     assert.equal(engine.status().level, 1, "an inconclusive probe does not escalate");
+    assert.ok(engine.status().probeBackoffUntil > clock.now());
   });
 
   it("never throws out of an observer", async () => {

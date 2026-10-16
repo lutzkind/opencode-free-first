@@ -7,7 +7,11 @@
  *   FREE_COOLDOWN -- cooldown reached   -->  FREE_PROBE
  *   FREE_PROBE    -- success            -->  FREE_HEALTHY
  *   FREE_PROBE    -- rate limited       -->  FREE_COOLDOWN (level + 1)
- *   FREE_PROBE    -- inconclusive       -->  FREE_COOLDOWN (level unchanged)
+ *   FREE_PROBE    -- inconclusive       -->  FREE_HEALTHY (unconfirmed)
+ *
+ * An inconclusive probe means *unknown*, never *limited*: it re-arms the probe
+ * on a bounded schedule but must never keep the free model blocked, because a
+ * probe that cannot run is not evidence that the free model is unusable.
  *
  * Everything here is pure and clock-injected so the whole ladder is covered by
  * deterministic tests. Cooldowns are always absolute epoch milliseconds: a
@@ -112,6 +116,18 @@ export function applyLimited(
       lastRateLimitType: input.reason,
       lastResetSource: source,
       ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+      // A new limit says nothing new about whether the probe path itself works,
+      // so the probe verdict survives it. Otherwise a structurally refused
+      // probe would be retried on every single limit cycle.
+      ...(health.probeBackoffUntil === undefined
+        ? {}
+        : { probeBackoffUntil: health.probeBackoffUntil }),
+      ...(health.inconclusiveProbes === undefined
+        ? {}
+        : { inconclusiveProbes: health.inconclusiveProbes }),
+      ...(health.lastProbeOutcome === undefined
+        ? {}
+        : { lastProbeOutcome: health.lastProbeOutcome }),
     },
     source,
     cooldownMs: until - input.now,
@@ -126,6 +142,9 @@ export function markHealthy(health: HealthRecord, now: number): HealthRecord {
     state: "FREE_HEALTHY",
     level: 0,
     lastHealthyAt: now,
+    probeBackoffUntil: undefined,
+    inconclusiveProbes: 0,
+    lastProbeOutcome: undefined,
     ...(health.lastRateLimitAt === undefined ? {} : { lastRateLimitAt: health.lastRateLimitAt }),
     ...(health.lastRateLimitType === undefined
       ? {}
@@ -151,16 +170,27 @@ export function extendCooldown(
  * inconclusive: the free model may be perfectly usable, but the provider is
  * unhealthy. Keep the current level and retry soon instead of escalating.
  */
-export function deferAfterInconclusiveProbe(
+export function markProbeInconclusive(
   health: HealthRecord,
-  now: number,
-  retryMs: number,
+  input: { readonly now: number; readonly retryMs: number; readonly outcome: string },
 ): HealthRecord {
+  // Built explicitly so the stored document never carries an `undefined`
+  // cooldown: `state` is what gates routing, and the field simply disappears.
   return {
-    ...health,
-    state: "FREE_COOLDOWN",
-    cooldownUntil: now + Math.max(1_000, retryMs),
-    lastResetSource: "backoff",
+    schemaVersion: HEALTH_SCHEMA_VERSION,
+    scope: health.scope,
+    state: "FREE_HEALTHY",
+    level: health.level,
+    ...(health.lastRateLimitAt === undefined ? {} : { lastRateLimitAt: health.lastRateLimitAt }),
+    ...(health.lastRateLimitType === undefined
+      ? {}
+      : { lastRateLimitType: health.lastRateLimitType }),
+    ...(health.lastResetSource === undefined ? {} : { lastResetSource: health.lastResetSource }),
+    ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+    probeBackoffUntil:
+      input.now + (Number.isFinite(input.retryMs) ? Math.max(1_000, input.retryMs) : 60_000),
+    inconclusiveProbes: (health.inconclusiveProbes ?? 0) + 1,
+    lastProbeOutcome: input.outcome,
   };
 }
 
@@ -169,6 +199,46 @@ export function inCooldown(health: HealthRecord, now: number): boolean {
   if (health.state === "FREE_HEALTHY") return false;
   if (health.cooldownUntil === undefined) return false;
   return health.cooldownUntil > now;
+}
+
+/**
+ * Drop a cooldown that has already elapsed.
+ *
+ * An elapsed cooldown must never keep the free model blocked, and it must not
+ * stay in the record either: a stale `FREE_COOLDOWN` would keep reporting
+ * `FREE_PROBE` and would keep waking the scheduler for a boundary that has
+ * already passed. The ladder position and the probe bookkeeping survive.
+ */
+export function clearElapsedCooldown(health: HealthRecord, now: number): HealthRecord {
+  if (health.state !== "FREE_COOLDOWN") return health;
+  if (health.cooldownUntil !== undefined && health.cooldownUntil > now) return health;
+  return {
+    schemaVersion: HEALTH_SCHEMA_VERSION,
+    scope: health.scope,
+    state: "FREE_HEALTHY",
+    level: health.level,
+    ...(health.lastRateLimitAt === undefined ? {} : { lastRateLimitAt: health.lastRateLimitAt }),
+    ...(health.lastRateLimitType === undefined
+      ? {}
+      : { lastRateLimitType: health.lastRateLimitType }),
+    ...(health.lastResetSource === undefined ? {} : { lastResetSource: health.lastResetSource }),
+    ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+    ...(health.probeBackoffUntil === undefined
+      ? {}
+      : { probeBackoffUntil: health.probeBackoffUntil }),
+    ...(health.inconclusiveProbes === undefined
+      ? {}
+      : { inconclusiveProbes: health.inconclusiveProbes }),
+    ...(health.lastProbeOutcome === undefined ? {} : { lastProbeOutcome: health.lastProbeOutcome }),
+  };
+}
+
+/**
+ * True when the recovery probe must stay quiet. A probe back-off never blocks
+ * the free model; it only schedules the next probe attempt.
+ */
+export function probeDeferred(health: HealthRecord, now: number): boolean {
+  return health.probeBackoffUntil !== undefined && health.probeBackoffUntil > now;
 }
 
 /** True when the cooldown has elapsed and the free model may be tested again. */
@@ -213,12 +283,25 @@ export function decodeHealth(value: unknown, scope: string): HealthRecord | unde
     return typeof entry === "number" && Number.isFinite(entry) ? entry : undefined;
   };
 
+  // Probe bookkeeping can never affect routing safety, so damaged values are
+  // dropped rather than discarding a real cooldown along with them.
+  const rawBackoff = nullableNumber("probeBackoffUntil");
+  const probeBackoffUntil = rawBackoff !== undefined && rawBackoff >= 0 ? rawBackoff : undefined;
+  const rawAttempts = nullableNumber("inconclusiveProbes");
+  const inconclusiveProbes =
+    rawAttempts !== undefined && rawAttempts >= 0 ? Math.floor(rawAttempts) : undefined;
+
   return {
     schemaVersion: HEALTH_SCHEMA_VERSION,
     scope,
     state,
     level: Math.floor(level),
     ...(cooldownUntil === undefined ? {} : { cooldownUntil }),
+    ...(probeBackoffUntil === undefined ? {} : { probeBackoffUntil }),
+    ...(inconclusiveProbes === undefined ? {} : { inconclusiveProbes }),
+    ...(typeof record.lastProbeOutcome === "string"
+      ? { lastProbeOutcome: record.lastProbeOutcome }
+      : {}),
     ...(nullableNumber("lastRateLimitAt") === undefined
       ? {}
       : { lastRateLimitAt: nullableNumber("lastRateLimitAt") as number }),

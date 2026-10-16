@@ -30,12 +30,25 @@ function defaults() {
     body: undefined,
     retryAfterSeconds: undefined,
     delayMs: 0,
+    /**
+     * Refuse the out-of-band recovery probe, identified by its configured
+     * prompt marker. OpenCode's own free tier does this
+     * (`Generate.UnavailableError`), so this models a host that refuses the
+     * probe path while serving the agent loop normally.
+     */
+    gateProbe: false,
   };
 }
 
 const served = { free: 0, paid: 0 };
 
-const state = { free: defaults(), paid: defaults(), log: [] };
+const state = {
+  free: defaults(),
+  paid: defaults(),
+  log: [],
+  /** The probe prompt the harness configures, so the gate is unambiguous. */
+  probeMarker: process.env.FF_MOCK_PROBE_MARKER ?? "FF_PROBE_PROBE_ONLY",
+};
 
 function roleOf(body) {
   try {
@@ -153,6 +166,19 @@ const server = http.createServer(async (request, response) => {
   });
 
   if (config.delayMs) await new Promise((resolve) => setTimeout(resolve, config.delayMs));
+
+  if (config.gateProbe === true && raw.includes(state.probeMarker)) {
+    state.log.push({ event: "probe-refused", model, role });
+    sendJson(response, 503, {
+      error: {
+        message:
+          "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.",
+        type: "server_error",
+        code: "unavailable",
+      },
+    });
+    return;
+  }
 
   if (effective !== "ok") {
     const status = { 429: 429, 500: 500, 401: 401, 400: 400 }[effective] ?? 500;

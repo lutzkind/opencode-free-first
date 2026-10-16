@@ -5,6 +5,8 @@
  * suite runs against these fakes so no real free-tier quota is consumed.
  */
 
+import { DEFAULT_CONFIG } from "../dist/config.js";
+
 export const FREE = { providerID: "fake", id: "fake-free" };
 export const PAID = { providerID: "fake", id: "fake-paid" };
 export const OTHER = { providerID: "other", id: "other-model" };
@@ -205,27 +207,20 @@ export function engineOptions(overrides) {
   const log = overrides.recorder ?? recorder();
   return {
     options: {
+      // Real defaults, so a new option can never be silently absent from a test.
       config: {
-        enabled: true,
+        ...DEFAULT_CONFIG,
         primary: FREE,
         fallback: PAID,
-        preferAsDefault: true,
         adoptFallbackSessions: true,
-        respectExplicitModelSelection: true,
-        passiveRecovery: true,
-        probe: true,
-        parkPreemption: true,
+        // Fast, deterministic timings for the state machine under test.
         backoffMs: [1_000, 2_000, 5_000],
         maxCooldownMs: 5_000,
         jitterRatio: 0,
         failoverRetryDelayMs: 100,
         duplicateLimitWindowMs: 5_000,
         probePrompt: "ping",
-        probeMaxTokens: 8,
         parkGraceMs: 1_000,
-        switchConfirmMs: 10_000,
-        continuationText: "continue",
-        cooldownScope: "shared",
         sessionLimit: 50,
         logLevel: "debug",
         ...(overrides.config ?? {}),

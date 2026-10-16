@@ -61,6 +61,37 @@ If the *transition* line appears but the retry still lands on the free model,
 another plugin's `retry` hook ran after free-first's and vetoed it. List
 `opencode-free-first` after any plugin that can veto retries.
 
+## Every new session goes to the fallback, even after the reset has passed
+
+Symptom: after a free-tier limit, `status` shows a short `FREE cooldown` that
+never really ends, and each new session is routed to the fallback at
+`prompt-admission` — hours after the provider's own reset time.
+
+Check `lastProbeOutcome` and `probeBackoffUntil` in `status`:
+
+- `unsupported:…` with a long `probeBackoffUntil` means the host refuses the probe
+  path. OpenCode's own free tier does this: transient generation is not the agent
+  loop, so it answers `Generate.UnavailableError` ("OpenCode's free tier can only be
+  used from within OpenCode"). The plugin logs
+  `the recovery probe is not permitted for this model; using passive recovery` at
+  `error` level and stops probing. This is expected and harmless: recovery happens
+  passively, and the free model is used again at the next real model call after the
+  cooldown expires.
+- `inconclusive:…` repeated with a growing delay means probes are failing for a
+  reason that is not a limit (transport, 5xx). The free model stays usable
+  regardless.
+
+If new sessions are *still* going to the fallback, the cooldown is still believed
+to be active. Confirm with `status`: `cooldownMs > 0` means a real cooldown is
+running, and `lastRateLimitAt` tells you when it was established. A `lastRateLimitAt`
+from before the provider's reset means you are looking at a stale cooldown — lift it
+with the `reset` action below, and report it: only a genuine limit should ever arm a
+cooldown.
+
+A cooldown whose timestamp has passed is dropped automatically, and a stale
+instance cannot resurrect one: `status` re-reads shared health before reporting, and
+every routing decision adopts the shared record first.
+
 ## The session never leaves the fallback
 
 Recovery has not been confirmed yet. Look at:

@@ -10,9 +10,16 @@ FREE_COOLDOWN  ── cooldownUntil is an absolute epoch-millisecond timestamp
     │  cooldownUntil <= now
     ▼
 FREE_PROBE
-    ├─ success       ──▶ FREE_HEALTHY
-    ├─ rate limited  ──▶ FREE_COOLDOWN  (level + 1)
-    └─ inconclusive  ──▶ FREE_COOLDOWN  (level kept, short retry)
+    ├─ success       ──▶ FREE_HEALTHY                       (recovery confirmed)
+    ├─ rate limited  ──▶ FREE_COOLDOWN  (level + 1)          (a real limit)
+    └─ inconclusive  ──▶ FREE_HEALTHY   (unconfirmed)        (unknown, never limited)
+
+An inconclusive result re-arms the *probe* on a bounded back-off
+(`probeBackoffUntil`) and returns the waiting sessions to the free model, so the
+next real model call becomes the test. It must never keep the free model blocked:
+a probe that cannot run is not evidence that the free model is unusable, and
+treating it as a limit is what let one un-runnable probe route every new session
+to the fallback indefinitely.
 ```
 
 Only `FREE_HEALTHY` and `FREE_COOLDOWN` are persisted. `FREE_PROBE` is derived:
@@ -29,7 +36,29 @@ mid-transition.
 | Request preparation, fallback model, cooldown elapsed | Delegate to the single recovery path. |
 | Retry hook, free model, genuine limit | Record the cooldown, switch to the fallback, force one cheap retry. |
 | Response observed, free model, non-error status | Confirmed recovery: clear the cooldown and reset the ladder. |
-| Recovery tick | Probe, then reclaim parked work, then return waiting sessions to the free model. |
+| Recovery tick | Probe, then reclaim parked work, then return waiting sessions to the free model. A probe that cannot decide counts as a fail-open outcome, not as a block. |
+
+## Probe outcomes
+
+Every probe attempt classifies its result three ways:
+
+| Outcome | Meaning | Effect |
+| --- | --- | --- |
+| `limited` | A real rate limit (`429`, structured `provider.rate-limit`/`provider.quota`, or exhaustion wording) | Arm (or extend) a real, blocking cooldown |
+| `unsupported` | The host refuses the probe path itself — OpenCode's free tier answers `Generate.UnavailableError` because transient generation is not the agent loop — or the model route is structurally refused (`invalid-request`, `no-route`, `auth`, `unsupported-operation`) | Fail open, log at `error`, and stop probing for `probeUnsupportedBackoffMs` (default 6h) |
+| `inconclusive` | Anything else: a transport error, a 5xx, anything unexplained | Fail open, escalate the probe back-off along the normal ladder (capped by `maxCooldownMs`), and let real traffic decide |
+
+None of the last two ever sets `cooldownUntil`, so none of them can keep the free
+model out of use. A later genuine limit still establishes a new blocking cooldown,
+and it keeps the probe verdict: a new limit says nothing new about whether the
+probe path works.
+
+## Elapsed cooldowns
+
+A cooldown whose timestamp has passed is removed from the record on every fail-open
+outcome. Keeping it would make `status` report `FREE_PROBE` and would keep waking
+the scheduler for a boundary already behind us, so an elapsed cooldown is
+normalised away while the ladder position and the probe bookkeeping survive.
 
 ## Reset metadata
 

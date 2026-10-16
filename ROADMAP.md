@@ -3,6 +3,15 @@
 Deliberately short. The plugin's job is narrow, and most ideas here would widen
 it, so each item needs evidence before it is implemented.
 
+## Awaiting an architecture decision
+
+- **Headless `opencode run` and park reclamation.** Cancelling a held fallback
+  request requires an interruption, and the headless runner treats any interruption
+  as the end of the run, so it returns before the resumed step. Fixing it needs a
+  change in OpenCode's headless client, in the parking plugin, or a wrapper — all
+  outside this plugin's approved scope. Reported as
+  `ARCHITECTURE CHANGE PROPOSED — USER APPROVAL REQUIRED`.
+
 ## Candidates
 
 - **Provider-reported scope.** Derive `cooldownScope` from evidence (for example a
