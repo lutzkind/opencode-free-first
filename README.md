@@ -90,7 +90,7 @@ OpenCode v2 accepts npm-compatible package specifications, including Git URLs
 and exact tags. Install the published release:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.5
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.6
 opencode plugin list
 ```
 

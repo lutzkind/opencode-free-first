@@ -3,6 +3,16 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] — 2026-10-16
+
+### Fixed
+
+- Share the recovery-probe back-off and attempt count between plugin instances,
+  like the cooldown itself. OpenCode loads one instance per location, so without
+  this a back-off established in one location was invisible everywhere else and
+  every instance could probe the same refused path again — a probe herd, and
+  misleading `status` output on the instance that answered.
+
 ## [0.1.5] — 2026-10-16
 
 ### Fixed
@@ -152,6 +162,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.6]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.6
 [0.1.5]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.5
 [0.1.4]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.4
 [0.1.3]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.3

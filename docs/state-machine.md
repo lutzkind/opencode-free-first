@@ -126,7 +126,9 @@ Used only when no reset metadata exists:
   healthy free model while a shared cooldown is active. The shared record is
   monotonic with respect to an active cooldown — a write never downgrades it — and
   a freshly started instance does not claim a recovery, so a start-up can never
-  overwrite a live cooldown.
+  overwrite a live cooldown. The probe back-off and attempt count are shared the
+  same way, so a probe verdict reached in one location is not re-earned by every
+  other one.
 
 ## Persistence
 

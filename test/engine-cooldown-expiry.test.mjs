@@ -189,6 +189,28 @@ describe("cross-instance state", () => {
     assert.equal(after.cooldownUntil, undefined);
   });
 
+  it("shares the probe back-off so instances do not probe in a herd", async () => {
+    const storage = new FakeStorage();
+    const generate = new FakeGenerate();
+    const { engine, clock } = await boot({ storage, generate });
+    // Another instance already probed and backed off.
+    await storage.set("opencode-free-first/health-v1", {
+      schemaVersion: 1,
+      scope: "fake/fake-free",
+      state: "FREE_HEALTHY",
+      level: 1,
+      probeBackoffUntil: clock.now() + 3_600_000,
+      inconclusiveProbes: 2,
+      lastProbeOutcome: "unsupported:unclassified-message",
+    });
+    await failover(engine, "ses_a");
+    await clock.advance(1_500);
+    assert.equal(generate.calls.length, 0, "no second probe for the same verdict");
+    assert.ok(engine.status().probeBackoffUntil > clock.now(), "the shared back-off is reported");
+    assert.equal(engine.status().inconclusiveProbes, 2);
+    assert.equal(engine.status().lastProbeOutcome, "unsupported:unclassified-message");
+  });
+
   it("a newer real limit replaces a healthy state with a fresh cooldown", async () => {
     const { engine, clock } = await boot();
     await failover(engine, "ses_a");

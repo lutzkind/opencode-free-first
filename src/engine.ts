@@ -973,10 +973,32 @@ export class FreeFirstEngine {
     const ourRecoveryAt =
       this.#health.state === "FREE_HEALTHY" ? (this.#health.lastHealthyAt ?? 0) : 0;
     if (ourRecoveryAt > (stored.lastRateLimitAt ?? 0)) return;
-    if (!newer && !longer) return;
+    // Probe bookkeeping is shared too: an instance that just backed the probe off
+    // must not be probed again immediately by every other instance.
+    const storedBackoff = stored.probeBackoffUntil ?? 0;
+    const ownBackoff = this.#health.probeBackoffUntil ?? 0;
+    const probeAhead =
+      storedBackoff > ownBackoff ||
+      (stored.inconclusiveProbes ?? 0) > (this.#health.inconclusiveProbes ?? 0);
+
+    if (!newer && !longer && !probeAhead) return;
     this.#health = {
       ...this.#health,
       level: Math.max(this.#health.level, stored.level),
+      ...(storedBackoff > ownBackoff ? { probeBackoffUntil: storedBackoff } : {}),
+      ...(stored.inconclusiveProbes === undefined
+        ? {}
+        : {
+            inconclusiveProbes: Math.max(
+              this.#health.inconclusiveProbes ?? 0,
+              stored.inconclusiveProbes,
+            ),
+          }),
+      ...(stored.lastProbeOutcome === undefined
+        ? {}
+        : storedBackoff > ownBackoff
+          ? { lastProbeOutcome: stored.lastProbeOutcome }
+          : {}),
       ...(storedCooldown > now
         ? { state: "FREE_COOLDOWN" as const, cooldownUntil: storedCooldown }
         : {}),
