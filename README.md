@@ -61,11 +61,13 @@ stays in charge of *when* paid work runs.
    settles free health before any session is moved. A probe that is rate limited
    changes nothing for a productive fallback session; a probe that merely fails is
    treated as *unknown*, so it can never keep the free model blocked.
-8. **Reclaims parked paid work.** If another plugin holds the fallback request
-   (for example an off-peak pricing policy), and the free model recovers first,
-   the plugin cancels the obsolete paid attempt, neutralises the parking
-   plugin's own pending continuation, and resumes the same task on the free
-   model with one invisible continuation step.
+8. **Reclaims parked paid work without interrupting the session.** If another
+   plugin holds the fallback request (for example an off-peak pricing policy) and
+   the free model recovers first, the plugin cancels the obsolete paid attempt
+   through the parking plugin's generic hold cancellation, and the same
+   execution continues on the free model. The held request is refused at the
+   transport boundary, so it is never sent, no continuation input is admitted,
+   and a headless `opencode run` stays attached until the task finishes.
 9. **Respects explicit model choices.** A manual change to an unrelated model —
    or to the paid route — stops free-first from managing that session.
 
@@ -159,7 +161,10 @@ Two ordering facts matter, and both are verified by the live coexistence suite
   transition either way, but the failover retry needs the last word.
 - Free-first never delays, queues, or prices paid work. When the fallback route
   is peak-priced it is held by the policy plugin, the session is parked, and
-  free-first reclaims it only after the free model is confirmed healthy.
+  free-first reclaims it only after the free model is confirmed healthy — by
+  asking that plugin to cancel the hold (`opencode-offpeak.cancelHold`), never
+  by interrupting the session. Without that capability the older
+  interrupt-based reclamation is used instead.
 
 Free-model traffic through OpenCode Zen is documented by OpenCode as flat
 priced, so a correctly configured policy plugin treats it as untracked or flat
@@ -172,11 +177,12 @@ FREE_HEALTHY  -- genuine free-model rate limit -->  FREE_COOLDOWN
 FREE_COOLDOWN -- cooldown reached               -->  FREE_PROBE
 FREE_PROBE    -- success                       -->  FREE_HEALTHY
 FREE_PROBE    -- rate limited                  -->  FREE_COOLDOWN (level + 1)
-FREE_PROBE    -- inconclusive                  -->  FREE_COOLDOWN (level kept)
+FREE_PROBE    -- inconclusive                  -->  FREE_HEALTHY (probe deferred)
 ```
 
 `FREE_PROBE` is derived, not stored: it is what `FREE_COOLDOWN` means once its
-absolute timestamp has passed and health is not yet confirmed. Cooldowns are
+absolute timestamp has passed and health is not yet confirmed. An inconclusive
+probe leaves the free model usable (see `docs/state-machine.md`). Cooldowns are
 absolute epoch milliseconds and always persisted, so a timer is a convenience and
 never the source of truth. A restart restores a future cooldown, discards an
 expired one, ignores corrupt derived state, and never probes merely because

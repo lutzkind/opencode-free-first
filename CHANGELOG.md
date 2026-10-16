@@ -3,6 +3,39 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] — 2026-10-16
+
+### Fixed
+
+- **Headless `opencode run` now survives park reclamation.** Reclaiming a
+  peak-held fallback request used to require `session.interrupt`, and OpenCode's
+  headless runner treats any interruption as the end of the run — so `opencode
+  run` exited before the resumed step produced an answer, even though the
+  session, model, and task were already correct. Reclamation now asks the
+  parking plugin to cancel the held request through its generic `cancelHold`
+  RPC capability: the cancelled request is refused at the transport boundary
+  (never sent), OpenCode reports a retryable transport failure, and this plugin
+  routes the retry back to the free model — inside the same execution. No
+  interruption, no continuation input, one user message, and the final answer
+  is returned normally.
+
+### Added
+
+- A versioned cooperation contract with `opencode-offpeak`
+  (`opencode-offpeak.cancelHold`, declared locally in `src/offpeak.ts` — no
+  source import) plus capability detection. When the neighbour is absent, older,
+  or refuses the call, reclamation falls back to the interrupt-based sequence
+  unchanged; nothing is guessed.
+- `status()` fields `holdCancelCapability`, `holdCancels`, and `pendingResumes`.
+- Integration coverage for the exact headless scenario: free limit, failover,
+  parked paid request, free recovery, cancellation, zero paid requests, and the
+  final answer printed by `opencode run` — plus transcript assertions (one user
+  message, no continuation input, two model transitions, one session, ends on
+  the free model) read from OpenCode's own database.
+- Unit coverage for the cancellation reclamation, the committed-race outcome,
+  the unavailable-capability fallback, the resume policy guards (override,
+  cooling-down, non-retryable, unrelated failure), and the status diagnostics.
+
 ## [0.1.6] — 2026-10-16
 
 ### Fixed
@@ -162,6 +195,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.7]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.7
 [0.1.6]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.6
 [0.1.5]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.5
 [0.1.4]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.4

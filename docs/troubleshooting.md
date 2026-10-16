@@ -114,17 +114,26 @@ Recovery has not been confirmed yet. Look at:
 
 ## The task seems to restart after recovery
 
-After a parked paid request is reclaimed, the log shows `stale fallback
-continuation neutralized` and `duplicate continuation prevented`, and the session
-records exactly one additional `synthetic` message containing the continuation
-sentence. That synthetic message is not rendered in the terminal and is not a
-duplicated prompt: the conversation history, agent, and working directory are
-unchanged.
+After a parked paid request is reclaimed, the log shows `parked fallback request
+detected`, `stale fallback continuation neutralized` with `via: "cancel-hold"`,
+and `same task resumed on the free model after its fallback attempt was refused`.
+Nothing was restarted: the held request was cancelled before it was ever sent,
+the same execution retried on the free model, and the session records exactly one
+user message with no extra input.
 
-A headless `opencode run` exits as soon as the interrupt settles, before the
-resumed step completes. The session, the model, and the continuation are already
-correct; open the session (or use `--continue`) to see it finish. The TUI does not
-have this limitation.
+The parking plugin refuses the cancelled attempt at the transport boundary, so a
+single retryable `provider.transport` failure is expected there and is what lets
+OpenCode continue on the free model. `status().holdCancels` counts those
+cancellations, and `status().holdCancelCapability` reports whether the neighbour
+supports the call at all.
+
+Without that capability — an older parking plugin, or none — reclamation uses the
+interrupt-based sequence instead: the log then shows `duplicate continuation
+prevented` and the session records one additional `synthetic` message (not
+rendered, not a duplicated prompt). A headless `opencode run` exits as soon as
+that interrupt settles, before the resumed step completes; the session, model,
+and continuation are already correct, so open the session (or use `--continue`)
+to see it finish. The TUI does not have this limitation.
 
 ## Switch churn
 

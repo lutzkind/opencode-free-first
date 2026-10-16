@@ -24,6 +24,7 @@ import { resolveConfig } from "./config.js";
 import type { Clock, ExecutionEvent, RetryInput, StateStore } from "./engine.js";
 import { FreeFirstEngine } from "./engine.js";
 import { createLogger } from "./log.js";
+import { createPaidHoldPort, OFFPEAK_CANCEL_HOLD_RPC } from "./offpeak.js";
 import type { FreeFirstRpcInput, FreeFirstRpcOutput } from "./rpc.js";
 import { FREE_FIRST_RPC, FREE_FIRST_USAGE } from "./rpc.js";
 import type { ModelRef } from "./types.js";
@@ -98,11 +99,28 @@ export default Plugin.define({
       ...(model.variant === undefined ? {} : { variant: model.variant }),
     });
 
+    // The neighbour plugin's generic hold cancellation. It is optional: an
+    // absent or older opencode-offpeak reports failure, and reclamation keeps
+    // its interrupt-based fallback instead of guessing.
+    const paidHolds =
+      config.parkPreemption && resolved.error === undefined
+        ? createPaidHoldPort(
+            (input) => context.rpc(OFFPEAK_CANCEL_HOLD_RPC).cancelHold({ ...input }),
+            (error) => {
+              logger.error(
+                "opencode-offpeak cancelled-hold capability is unavailable; reclamation falls back to interruption",
+                { detail: error instanceof Error ? error.message : String(error) },
+              );
+            },
+          )
+        : undefined;
+
     engine = new FreeFirstEngine({
       config,
       clock,
       storage,
       logger,
+      ...(paidHolds === undefined ? {} : { paidHolds }),
       random: Math.random,
       onError: (error) => {
         logger.error("background failure", {
@@ -260,40 +278,36 @@ export default Plugin.define({
       ),
     );
 
+    // Unscoped on purpose: failover decisions belong to the free model, and the
+    // resume-after-refusal decision belongs to the fallback model.
     registrations.push(
-      await context.session.hook(
-        "retry",
-        async (event) => {
-          if (!config.enabled) return;
-          try {
-            const input: RetryInput = {
-              sessionID: String(event.sessionID),
-              model: asRef(event.model),
-              error: {
-                ...(typeof event.error.type === "string" ? { type: event.error.type } : {}),
-                ...(typeof event.error.message === "string"
-                  ? { message: event.error.message }
-                  : {}),
-                ...(typeof event.error.status === "number" ? { status: event.error.status } : {}),
-                ...(event.error.response?.body === undefined
-                  ? {}
-                  : { response: { body: event.error.response.body } }),
-              },
-              attempt: event.attempt,
-              decision: event.decision,
-            };
-            await engine.onRetry(input);
-            // The engine owns the decision; copy it back onto the live event so
-            // OpenCode actually schedules the failover retry.
-            event.decision = input.decision;
-          } catch (error) {
-            logger.error("retry hook failed", {
-              detail: error instanceof Error ? error.message : String(error),
-            });
-          }
-        },
-        { providerID: config.primary.providerID },
-      ),
+      await context.session.hook("retry", async (event) => {
+        if (!config.enabled) return;
+        try {
+          const input: RetryInput = {
+            sessionID: String(event.sessionID),
+            model: asRef(event.model),
+            error: {
+              ...(typeof event.error.type === "string" ? { type: event.error.type } : {}),
+              ...(typeof event.error.message === "string" ? { message: event.error.message } : {}),
+              ...(typeof event.error.status === "number" ? { status: event.error.status } : {}),
+              ...(event.error.response?.body === undefined
+                ? {}
+                : { response: { body: event.error.response.body } }),
+            },
+            attempt: event.attempt,
+            decision: event.decision,
+          };
+          await engine.onRetry(input);
+          // The engine owns the decision; copy it back onto the live event so
+          // OpenCode actually schedules the failover retry.
+          event.decision = input.decision;
+        } catch (error) {
+          logger.error("retry hook failed", {
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }),
     );
 
     // Bound the recovery probe's output. Only requests issued while a probe is

@@ -33,6 +33,7 @@ import {
   remainingCooldown,
 } from "./health.js";
 import type { Logger } from "./log.js";
+import type { CancelHoldResult, PaidHoldPort } from "./offpeak.js";
 import type { FreeState, HealthRecord, ModelRef, SessionRecord, SessionRoute } from "./types.js";
 import {
   HEALTH_SCHEMA_VERSION,
@@ -117,6 +118,11 @@ export interface EngineOptions {
   readonly storage: StateStore;
   readonly sessions: SessionDriver;
   readonly generate: GeneratePort;
+  /**
+   * The neighbour plugin that owns paid holds, when it is installed. Optional:
+   * without it reclamation keeps its interrupt-based fallback behaviour.
+   */
+  readonly paidHolds?: PaidHoldPort;
   readonly logger: Logger;
   readonly random: () => number;
   readonly onError?: (error: unknown) => void;
@@ -142,6 +148,12 @@ export interface EngineStatus {
   readonly probeBackoffUntil?: number;
   readonly inconclusiveProbes?: number;
   readonly lastProbeOutcome?: string;
+  /** Capability of the neighbour plugin's generic hold cancellation. */
+  readonly holdCancelCapability?: "unknown" | "available" | "unavailable";
+  /** Cancellations accepted / settled by dispatch / unavailable. */
+  readonly holdCancels?: { accepted: number; committed: number; unavailable: number };
+  /** Sessions waiting for a refused fallback attempt to return to the free model. */
+  readonly pendingResumes?: number;
   readonly managedSessions: number;
   readonly fallbackSessions: number;
   readonly managedSessionIds: readonly string[];
@@ -165,6 +177,12 @@ interface PrepareMark {
 }
 
 const MAX_TRANSITIONS = 40;
+/**
+ * How long a cancellation request stays eligible for its refused attempt to
+ * come back through the retry hook. A refusal is a transport failure that
+ * arrives within one attempt, so this only bounds a lost race.
+ */
+const REFUSAL_RESUME_WINDOW_MS = 60_000;
 /** Upper bound on waiting for a preempted session to settle. */
 const PARK_SETTLE_TIMEOUT_MS = 15_000;
 
@@ -180,6 +198,7 @@ export class FreeFirstEngine {
   readonly #storage: StateStore;
   readonly #sessions: SessionDriver;
   readonly #generate: GeneratePort;
+  readonly #paidHolds: PaidHoldPort | undefined;
   readonly #logger: Logger;
   readonly #random: () => number;
   readonly #onError: (error: unknown) => void;
@@ -194,6 +213,13 @@ export class FreeFirstEngine {
   readonly #lastHeaders = new Map<string, Record<string, string>>();
   readonly #previousModels = new Map<string, ModelRef>();
   readonly #variantIndex = new Map<string, readonly string[]>();
+  /**
+   * Sessions whose parked paid request this plugin just asked to cancel. The
+   * resulting refusal is a transport failure, and this marker keeps the resume
+   * policy narrow: only a fallback failure that follows our own cancellation
+   * returns the session to the free model.
+   */
+  readonly #pendingResumes = new Map<string, number>();
 
   #transitions: string[] = [];
   #loggedExpiry: number | undefined;
@@ -212,6 +238,7 @@ export class FreeFirstEngine {
     this.#storage = options.storage;
     this.#sessions = options.sessions;
     this.#generate = options.generate;
+    this.#paidHolds = options.paidHolds;
     this.#logger = options.logger;
     this.#random = options.random;
     this.#onError = options.onError ?? (() => {});
@@ -395,7 +422,10 @@ export class FreeFirstEngine {
         this.#markDirty();
       }
     } else if (this.#isFallback(model)) {
-      state.model = model;
+      // A request this plugin just asked the parking plugin to cancel is
+      // obsolete work: it reached the boundary only to be refused, and it must
+      // not be mistaken for the model the session is actually on.
+      if (!this.#pendingResumes.has(sessionID)) state.model = model;
     }
     this.#schedule();
   }
@@ -481,6 +511,8 @@ export class FreeFirstEngine {
     }
     this.#executing.delete(event.sessionID);
     this.#prepared.delete(event.sessionID);
+    // A settled execution cannot be resumed by a refused attempt any more.
+    this.#pendingResumes.delete(event.sessionID);
     // A settled execution is deliberately NOT a free-health proof: the turn may
     // have succeeded on the fallback model. Only a response from the free model
     // itself, or a probe, may clear a cooldown.
@@ -495,6 +527,10 @@ export class FreeFirstEngine {
    */
   async onRetry(input: RetryInput): Promise<void> {
     if (!this.#active()) return;
+    if (this.#isFallback(input.model)) {
+      await this.#resumeOnFreeAfterRefusal(input);
+      return;
+    }
     if (!this.#isPrimary(input.model)) return;
 
     const classification = classifyFreeLimit(input.error);
@@ -718,6 +754,11 @@ export class FreeFirstEngine {
         ? {}
         : { probeBackoffUntil: this.#health.probeBackoffUntil }),
       inconclusiveProbes: this.#health.inconclusiveProbes ?? 0,
+      ...(this.#paidHolds === undefined
+        ? {}
+        : { holdCancelCapability: this.#paidHolds.capability() }),
+      ...(this.#paidHolds === undefined ? {} : { holdCancels: this.#paidHolds.calls() }),
+      pendingResumes: this.#pendingResumes.size,
       ...(this.#health.lastProbeOutcome === undefined
         ? {}
         : { lastProbeOutcome: this.#health.lastProbeOutcome }),
@@ -841,6 +882,88 @@ export class FreeFirstEngine {
       });
       this.#onError(error);
     }
+  }
+
+  /**
+   * A cancelled paid hold comes back as a refused attempt: the parking plugin
+   * lets the request reach the transport boundary but refuses to send it, so
+   * OpenCode reports a retryable transport failure and asks for a retry
+   * decision. This is where the task returns to the free model inside the same
+   * execution — no session interruption, no extra input, and the parked paid
+   * request was never dispatched.
+   *
+   * The marker set by `#cancelHeldRequest` keeps this narrow: only a fallback
+   * failure that follows our own cancellation is resumed here, so ordinary
+   * fallback failures keep whatever the user and OpenCode chose.
+   */
+  async #resumeOnFreeAfterRefusal(input: RetryInput): Promise<void> {
+    const requestedAt = this.#pendingResumes.get(input.sessionID);
+    if (requestedAt === undefined) return;
+    const now = this.#clock.now();
+    if (now - requestedAt > REFUSAL_RESUME_WINDOW_MS) {
+      this.#pendingResumes.delete(input.sessionID);
+      return;
+    }
+    const state = this.#sessionsState.get(input.sessionID);
+    if (state === undefined || !state.managed || state.optOut !== undefined) {
+      this.#pendingResumes.delete(input.sessionID);
+      return;
+    }
+    const retryable = input.decision.retry === true || input.error.type === "provider.transport";
+    if (!retryable) {
+      this.#pendingResumes.delete(input.sessionID);
+      this.#log(
+        "info",
+        "refused fallback attempt is not retryable; leaving the decision to OpenCode",
+        {
+          sessionID: input.sessionID,
+          type: input.error.type ?? "unknown",
+          status: input.error.status ?? 0,
+        },
+      );
+      return;
+    }
+    if (inCooldown(this.#health, now)) {
+      // The free model is not usable yet after all. Keep the marker: the retry
+      // may reach this hook again once recovery has settled.
+      this.#log(
+        "info",
+        "refused fallback attempt cannot resume yet; free model is still cooling down",
+        {
+          sessionID: input.sessionID,
+          cooldown: formatDuration(remainingCooldown(this.#health, now)),
+        },
+      );
+      return;
+    }
+    this.#pendingResumes.delete(input.sessionID);
+    await this.#upgrade(input.sessionID, "refused-fallback");
+    input.decision = { retry: true, delay: this.#config.failoverRetryDelayMs };
+    this.#log(
+      "info",
+      "same task resumed on the free model after its fallback attempt was refused",
+      {
+        sessionID: input.sessionID,
+        type: input.error.type ?? "unknown",
+        attempt: input.attempt,
+        retryDelayMs: this.#config.failoverRetryDelayMs,
+      },
+    );
+  }
+
+  /**
+   * Ask the plugin that owns the parked paid request to cancel it. Returns
+   * `undefined` when there is no such capability, in which case the caller
+   * keeps its interrupt-based reclamation.
+   */
+  async #cancelHeldRequest(sessionID: string): Promise<CancelHoldResult | undefined> {
+    const port = this.#paidHolds;
+    if (port === undefined) return undefined;
+    const result = await port.cancel({ sessionID });
+    if (result?.cancelled === true) {
+      this.#pendingResumes.set(sessionID, this.#clock.now());
+    }
+    return result;
   }
 
   async #upgrade(sessionID: string, trigger: string): Promise<void> {
@@ -1410,35 +1533,64 @@ export class FreeFirstEngine {
   async #preempt(sessionID: string, parkedMs: number): Promise<void> {
     try {
       this.#log("info", "parked fallback request detected", { sessionID, parkedMs });
-      // 1. Cancel the parked paid attempt. The parking plugin observes the
-      //    interruption and drops its own pending continuation, so the obsolete
-      //    paid work can never run twice.
-      const result = await this.#sessions.interrupt({ sessionID });
-      if (!result.interrupted) {
-        this.#log("info", "no active execution to preempt; parked request already settled", {
+      // 1. The recovery decision: this session belongs on the free model again.
+      await this.#upgrade(sessionID, "park-preemption");
+      // 2. Ask the plugin holding the paid request to cancel it. The cancelled
+      //    request is refused at the transport boundary (never sent) and
+      //    `#resumeOnFreeAfterRefusal` continues the same execution on the free
+      //    model, so nothing interrupts the session and a headless
+      //    `opencode run` stays attached until the task finishes.
+      const cancelled = await this.#cancelHeldRequest(sessionID);
+      if (cancelled?.cancelled === true) {
+        this.#log("info", "stale fallback continuation neutralized", {
           sessionID,
+          via: "cancel-hold",
         });
         return;
       }
-      this.#log("info", "stale fallback continuation neutralized", { sessionID });
-      // 2. Let the cancellation settle so the continuation cannot race it.
-      await this.#waitIdle(sessionID);
-      // 3. Route the continuation to the free model, then admit one invisible
-      //    continuation input and wake the session. Same session, same
-      //    conversation, same working directory — one extra step, never a
-      //    duplicated prompt or a replayed tool call.
-      await this.#upgrade(sessionID, "park-preemption");
-      await this.#sessions.synthetic({
-        sessionID,
-        text: this.#config.continuationText,
-        delivery: "steer",
-        resume: true,
-      });
-      this.#log("info", "duplicate continuation prevented", { sessionID });
+      if (cancelled !== undefined) {
+        // The dispatch decision had already been taken (or nothing was parked).
+        // The paid work continues; the session returns to the free model at its
+        // next safe boundary.
+        this.#log("info", "parked fallback request was not cancellable; leaving it to settle", {
+          sessionID,
+          state: cancelled.state,
+        });
+        return;
+      }
+      await this.#preemptByInterrupt(sessionID);
     } catch (error) {
       this.#log("error", "failed to preempt a parked fallback request", { sessionID });
       this.#onError(error);
     }
+  }
+
+  /**
+   * Fallback reclamation for a parking plugin without the cancellation
+   * capability: one invisible continuation is admitted, the parked execution is
+   * interrupted, and the continuation resumes on the free model. This keeps the
+   * documented behaviour for older or absent neighbours; it is not used when
+   * the hold could be cancelled.
+   */
+  async #preemptByInterrupt(sessionID: string): Promise<void> {
+    const result = await this.#sessions.interrupt({ sessionID });
+    if (!result.interrupted) {
+      this.#log("info", "no active execution to preempt; parked request already settled", {
+        sessionID,
+      });
+      return;
+    }
+    this.#log("info", "stale fallback continuation neutralized", { sessionID, via: "interrupt" });
+    // Let the cancellation settle so the continuation cannot race it.
+    await this.#waitIdle(sessionID);
+    await this.#upgrade(sessionID, "park-preemption");
+    await this.#sessions.synthetic({
+      sessionID,
+      text: this.#config.continuationText,
+      delivery: "steer",
+      resume: true,
+    });
+    this.#log("info", "duplicate continuation prevented", { sessionID });
   }
 
   /**

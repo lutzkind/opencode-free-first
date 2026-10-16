@@ -149,6 +149,50 @@ export class FakeSessions {
   }
 }
 
+/**
+ * The neighbour plugin's hold-cancellation port, as opencode-free-first sees it.
+ * `result` is what the neighbour answers; `fail` models an absent or older
+ * plugin that does not implement the capability at all.
+ */
+export class FakePaidHolds {
+  requests = [];
+  #result;
+  #fail;
+  #capability = "unknown";
+  #accepted = 0;
+  #committed = 0;
+  #unavailable = 0;
+
+  constructor(
+    result = { cancelled: true, state: "refused", model: "fake/fake-paid" },
+    fail = false,
+  ) {
+    this.#result = result;
+    this.#fail = fail;
+  }
+
+  async cancel({ sessionID }) {
+    this.requests.push({ sessionID });
+    if (this.#fail) {
+      this.#capability = "unavailable";
+      this.#unavailable += 1;
+      return undefined;
+    }
+    this.#capability = "available";
+    if (this.#result?.cancelled === true) this.#accepted += 1;
+    else this.#committed += 1;
+    return this.#result;
+  }
+
+  capability() {
+    return this.#capability;
+  }
+
+  calls() {
+    return { accepted: this.#accepted, committed: this.#committed, unavailable: this.#unavailable };
+  }
+}
+
 /** Transient generation port used for recovery probes. */
 export class FakeGenerate {
   calls = [];
@@ -231,6 +275,7 @@ export function engineOptions(overrides) {
       generate,
       logger: log.logger,
       random: () => 0.5,
+      ...(overrides.paidHolds ? { paidHolds: overrides.paidHolds } : {}),
       ...(overrides.onError ? { onError: overrides.onError } : {}),
       ...(overrides.onProbeState ? { onProbeState: overrides.onProbeState } : {}),
     },

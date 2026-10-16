@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-first",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "OpenCode v2 plugin that prefers a free model and fails over and recovers around free-tier rate limits.",
   "author": "Lutz Kind",
   "license": "MIT",

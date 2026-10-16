@@ -164,7 +164,7 @@ the current rate-limit window, so `applyLimited` carries the probe back-off and
 attempt count forward. Otherwise a structurally refused probe would be retried once
 per limit cycle forever.
 
-## 022 — Park reclamation cannot be make headless-safe without an architecture change
+## 022 — Park reclamation cannot be make headless-safe without an architecture change (superseded by 023)
 
 `opencode run` ends its stream loop unconditionally on
 `session.execution.interrupted` (verified in OpenCode 2.0.30), and cancelling a
@@ -177,6 +177,31 @@ headless client, changing the parking plugin, or introducing a wrapper/daemon; a
 three are outside the approved architecture, so it is reported as
 `ARCHITECTURE CHANGE PROPOSED — USER APPROVAL REQUIRED` rather than changed
 silently.
+
+## 023 — Park reclamation cancels the hold instead of interrupting the session (supersedes 022)
+
+OpenCode's plugin API gives a pre-model hook exactly three exits: return (the
+request is dispatched), throw (a defect that fails the execution), or be
+interrupted (the turn ends). None of them let a plugin cancel a held request and
+continue the same execution, which is why reclamation used `session.interrupt`
+and why the headless runner — which treats any interruption as terminal — exited
+before the resumed step answered.
+
+The way out is not another failure channel but the *transport* one: the plugin
+that owns the hold can be asked, generically and through RPC, to cancel it, and
+it then refuses the request at the boundary instead of sending it. A refusal is a
+typed, retryable transport failure, so OpenCode's own retry machinery continues
+the same execution, and this plugin's retry hook only has to route that retry to
+the free model. No interruption, no continuation input, no second session, and
+`opencode run` returns the final answer normally. The capability is versioned and
+optional: when the neighbour is absent, older, or refuses the call, reclamation
+keeps the interrupt-based sequence unchanged rather than guessing. Evidence: the
+integration suite's headless case (free limit → failover → parked paid request →
+free recovery → cancellation → zero paid requests → final answer printed by
+`opencode run`, with transcript assertions for one user message, no continuation
+input, two model transitions, one session, and the free model at the end), plus
+unit coverage of the committed race, the unavailable capability, the resume
+guards, and the degraded interrupt path.
 
 ## 017 — No paid traffic to keep a cache warm
 

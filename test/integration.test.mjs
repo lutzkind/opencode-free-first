@@ -15,6 +15,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -22,7 +23,7 @@ const ENABLED = process.env.FF_INTEGRATION === "1";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
 const OFFPEAK_SPEC =
-  process.env.FF_OFFPEAK_SPEC ?? "git+https://github.com/lutzkind/opencode-offpeak.git#v0.1.6";
+  process.env.FF_OFFPEAK_SPEC ?? "git+https://github.com/lutzkind/opencode-offpeak.git#v0.1.8";
 
 function opencodeBinary() {
   if (process.env.FF_OPENCODE) return process.env.FF_OPENCODE;
@@ -193,6 +194,46 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     return { status: result.status, stdout: `${result.stdout ?? ""}${result.stderr ?? ""}` };
   }
 
+  /**
+   * The persisted transcript of the newest session in the project, straight
+   * from OpenCode's own database. Used to prove what the run actually did
+   * (messages, model switches, tool calls) instead of inferring it from logs.
+   */
+  function transcript() {
+    const db = new DatabaseSync(path.join(home, "data", "opencode", "opencode.db"), {
+      readOnly: true,
+    });
+    try {
+      // The harness starts from an empty data directory, so every session in
+      // this database belongs to the case under test.
+      const sessions = db
+        .prepare(
+          "select id, directory, model, idle_outcome, time_created from session_v2 order by time_created",
+        )
+        .all();
+      const session = sessions.at(-1);
+      if (session === undefined) return { sessions: [], messages: [], parts: [], model: undefined };
+      const messages = db
+        .prepare("select type, data from session_message where session_id = ? order by seq")
+        .all(session.id)
+        .map((row) => ({ type: row.type, data: JSON.parse(row.data ?? "{}") }));
+      // Content parts live inside the assistant messages' `content` array in this
+      // schema (the separate `part` table belongs to the older v1 store).
+      const parts = messages
+        .filter((message) => message.type === "assistant")
+        .flatMap((message) => message.data.content ?? []);
+      return {
+        session,
+        sessions,
+        messages,
+        parts,
+        model: JSON.parse(session.model ?? "{}"),
+      };
+    } finally {
+      db.close();
+    }
+  }
+
   /** Every model the provider was asked for, in order. */
   function models(state) {
     return state.log.filter((entry) => entry.event === "request").map((entry) => entry.model);
@@ -357,7 +398,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       paid: { mode: "ok" },
     });
 
-    const outcome = await withServer(async ({ call }) => {
+    const outcome = await withServer(async ({ call, output }) => {
       const created = await call("POST", "/api/session", {
         title: "coexistence",
         model: { providerID: "ffmock", id: "ff-free" },
@@ -385,7 +426,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
         if (answered) break;
       }
       const session = (await call("GET", `/api/session/${sessionID}`))?.data;
-      return { sessionID, messages, session };
+      return { sessionID, messages, session, log: output() };
     });
 
     const assistantText = outcome.messages
@@ -396,15 +437,16 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       .join(" ");
     assert.match(assistantText, /MOCK_OK model=ff-free/, "the task finished on the free model");
 
-    // No lost context, no duplicate work, no interruption left behind.
+    // No lost context, no duplicate work, no interruption left behind. The
+    // same execution continued on the free model after the hold was cancelled,
+    // so no continuation input was needed at all.
     const users = outcome.messages.filter((message) => message.type === "user");
     assert.equal(users.length, 1, "the user prompt was never duplicated");
     const synthetic = outcome.messages.filter((message) => message.type === "synthetic");
-    assert.equal(synthetic.length, 1, "exactly one invisible continuation was admitted");
-    assert.ok(
-      synthetic[0].text.includes("Continue from where you left off"),
-      "the continuation resumes the task instead of repeating it",
-    );
+    assert.equal(synthetic.length, 0, "no continuation input was admitted");
+    assert.match(outcome.log, /stale fallback continuation neutralized/);
+    assert.match(outcome.log, /via: "cancel-hold"/);
+    assert.doesNotMatch(outcome.log, /session\.execution\.interrupted/);
     const settled = outcome.messages.filter((message) => message.type === "idle");
     assert.equal(
       settled[settled.length - 1]?.outcome,
@@ -531,10 +573,17 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     );
   });
 
-  it("Case 3 — a parked paid fallback is reclaimed for the free model", async () => {
+  it("Case 3 — a parked paid fallback is reclaimed for the free model without interrupting the session", async () => {
     // The paid route is peak-priced for the whole test window and the free
     // route is declared flat and never delayed, so opencode-offpeak holds paid
     // work exactly as it would in production while leaving the free model free.
+    //
+    // This is the required headless acceptance case: the free route rate limits,
+    // the session fails over to peak-priced paid work, opencode-offpeak parks
+    // that request, the free route becomes usable again before the paid window
+    // opens, and free-first reclaims the task through the neighbour's generic
+    // hold cancellation. Nothing interrupts the session, so the plain
+    // `opencode run` client stays attached and prints the final answer.
     offpeakConfig({
       id: "ffmock-paid-peak",
       providers: ["ffmock"],
@@ -546,13 +595,12 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       source: "integration test",
     });
     reset();
-    // The free tier rate limits the title and agent requests, then recovers —
-    // which is the only way the parked paid work can become obsolete.
     await control({
       log: [],
       free: { mode: "429", retryAfterSeconds: 1, failFirst: 3 },
       paid: { mode: "ok" },
     });
+
     const result = await run("Reply with the word READY");
     const parkedState = await mockState();
     if (process.env.FF_KEEP_HOME === "1") {
@@ -560,39 +608,83 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       writeFileSync(path.join(home, "case3-mock.json"), JSON.stringify(parkedState, null, 2));
     }
 
-    // The paid route is peak-priced for the whole test window, so opencode-offpeak
-    // holds it and no paid request is ever dispatched.
+    // 8. The run stayed attached, exited 0, and printed the final answer.
+    assertOk(result);
+    assert.match(
+      result.stdout,
+      /MOCK_OK model=ff-free/,
+      "the final answer came from the free model",
+    );
+
+    // 2 and 3: the fallback switched to paid and the neighbour parked it.
+    assert.match(result.stdout, /fallback selected/);
+    assert.match(result.stdout, /parked fallback request detected/);
+    // 5: free-first reclaimed the task with the generic cancellation.
+    assert.match(result.stdout, /stale fallback continuation neutralized/);
+    assert.match(result.stdout, /via: "cancel-hold"/);
+    assert.match(result.stdout, /same task resumed on the free model/);
+    // 6: the parked paid request was refused at the transport boundary and the
+    // paid provider received zero requests.
     const state = parkedState;
     assert.equal(
       models(state).filter((model) => model === "ff-paid").length,
       0,
       "the parked paid request was never dispatched",
     );
-    assert.match(result.stdout, /fallback selected/);
-    assert.match(result.stdout, /request prepared/);
-    assert.match(result.stdout, /parked fallback request detected/);
-    assert.match(result.stdout, /stale fallback continuation neutralized/);
-    assert.match(result.stdout, /duplicate continuation prevented/);
-    // The same session is put back on the free model, so the task continues on
-    // the free route rather than waiting out the peak window.
-    assert.match(result.stdout, /trigger: "park-preemption"/);
-    assert.match(result.stdout, /returned to free model/);
 
-    // Known headless limitation, reported as ARCHITECTURE CHANGE PROPOSED in
-    // HANDOFF.md. `opencode run` treats any `session.execution.interrupted`
-    // event as the end of the run (OpenCode 2.0.30, headless runner), and
-    // cancelling a held fallback request requires an interruption. The session,
-    // model, and continuation are already correct — a live `opencode serve`
-    // completes the resumed turn, which case 3b proves. If the host ever keeps
-    // the headless client attached, this assertion must be updated to require
-    // the resumed answer.
-    assert.equal(
-      result.stdout.includes("MOCK_OK model=ff-free"),
-      false,
-      "headless client exited before the resumed step; see the park-reclamation proposal",
+    // The successful path needs no interruption and no extra input.
+    assert.doesNotMatch(
+      result.stdout,
+      /session\.execution\.interrupted/,
+      "no interruption was needed",
     );
-    // The resumed turn asks the free model again, and that request succeeds:
-    // the task continues on the free route with no paid work ever dispatched.
+    assert.doesNotMatch(
+      result.stdout,
+      /duplicate continuation prevented/,
+      "the interrupt-based fallback was not used",
+    );
+    assert.equal(
+      (result.stdout.match(/model transition/g) ?? []).length,
+      2,
+      "exactly the minimum transitions: failover to paid, then back to free",
+    );
+
+    // The persisted transcript is the strongest evidence: one prompt, one
+    // answer, two model switches, no continuation input, no tool call.
+    const record = transcript();
+    assert.equal(record.sessions.length, 1, "no second session");
+    const users = record.messages.filter((message) => message.type === "user");
+    assert.equal(users.length, 1, "one user message only");
+    const continuations = record.messages.filter(
+      (message) => message.type === "synthetic" && message.data.metadata?.instruction === undefined,
+    );
+    assert.equal(continuations.length, 0, "no continuation input was admitted");
+    const answers = record.messages.filter(
+      (message) =>
+        message.type === "assistant" &&
+        String(message.data.model?.id ?? "") === "ff-free" &&
+        (message.data.content ?? []).some(
+          (part) => part.type === "text" && String(part.text ?? "").includes("MOCK_OK"),
+        ),
+    );
+    assert.equal(answers.length, 1, "exactly one final answer, from the free model");
+    const paidAnswers = record.messages.filter(
+      (message) =>
+        message.type === "assistant" && String(message.data.model?.id ?? "") === "ff-paid",
+    );
+    assert.equal(paidAnswers.length, 0, "the paid model never produced an answer");
+    const switches = record.messages.filter((message) => message.type === "model-switched");
+    assert.equal(switches.length, 2, "one switch to the fallback and one back to the free model");
+    assert.equal(
+      record.parts.filter((part) => part.type === "tool").length,
+      0,
+      "no tool call was executed, so none can be duplicated",
+    );
+    assert.equal(record.model.id, "ff-free", "the session ends on the free model");
+    assert.equal(record.session.idle_outcome, "succeeded", "the turn succeeded, not interrupted");
+
+    // 7: the free route answered after recovery, and the free tier limited
+    // exactly the configured requests.
     const freeRequests = state.log.filter(
       (entry) => entry.event === "request" && entry.role === "free",
     );
@@ -601,6 +693,14 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     assert.ok(
       freeRequests.length >= 4,
       `expected a post-recovery free request: ${JSON.stringify(models(state))}`,
+    );
+    // No stale paid continuation fires later, either.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const after = await mockState();
+    assert.equal(
+      models(after).filter((model) => model === "ff-paid").length,
+      0,
+      "no delayed paid dispatch after the run",
     );
     offpeakConfig(undefined);
   });

@@ -55,16 +55,20 @@ out of band, confirms recovery, and reclaims the parked task:
 
 ```
 fallback request prepared → held by the policy plugin
-free cooldown expires     → probe → free healthy
-interrupt                 → the parked paid attempt is cancelled, and the policy
-                            plugin drops its own pending continuation
+free cooldown expires     → free healthy (probe or passive recovery)
 switch to free            → the session is back on the free model
-synthetic continuation    → the same session, conversation, agent, and working
-                            directory continue, and the task finishes on free
+cancelHold                → the policy plugin refuses the held request at the
+                            transport boundary; it is never sent
+retry on free             → the same execution continues, and the task finishes
+                            on the free model — no interruption, no extra input
 ```
 
 Asserted in the suite: zero paid requests dispatched, exactly one user message,
-exactly one invisible continuation, and a successful (not interrupted) turn.
+no continuation input, exactly two model transitions, one session, and a
+successful turn whose final answer comes from the free model — printed by a plain
+headless `opencode run` as well as by a live server. When the policy plugin has
+no cancellation capability, free-first falls back to the interrupt-based
+sequence, whose headless limitation is documented in `docs/troubleshooting.md`.
 
 ### 4 — Free model still limited
 

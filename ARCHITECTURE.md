@@ -232,16 +232,27 @@ plugin:
 - If a session is executing, its prepared fallback request is still undispatched
   after `parkGraceMs`, and free health is confirmed, the parked work is obsolete.
 
-Reclamation is a three-step sequence, in this order:
+Reclamation is a two-step sequence, in this order:
 
-1. `session.interrupt({ sessionID })` cancels the parked attempt. The parking
-   plugin observes `session.execution.interrupted` and drops its own pending
-   continuation, so the obsolete paid work can never run twice.
-2. Wait (bounded) for the cancellation to settle.
-3. Switch the session to the free model, then admit one invisible continuation
-   input with `session.synthetic({ delivery: "steer", resume: true })`. The same
-   session, conversation, agent, and working directory continue; the synthetic
-   input is not rendered in the terminal and carries no business side effect.
+1. The session is switched back to the free model (the recovery decision).
+2. The parking plugin is asked to cancel the held request through the versioned
+   `opencode-offpeak.cancelHold` RPC capability, declared locally in
+   `src/offpeak.ts`. The cancellation is authoritative: `cancelled: true` means
+   the hold lost its race, `state: "committed"` means dispatch had already been
+   decided and the caller leaves the paid work alone.
+
+A cancelled request is *refused* by the parking plugin at the transport boundary
+instead of being sent, so OpenCode reports a retryable transport failure and this
+plugin's `retry` hook routes the retry back to the free model — inside the same
+execution. That is what makes the reclamation safe for a headless
+`opencode run`: no `session.interrupt`, so nothing ends the run, no continuation
+input is admitted, and the final answer is returned normally.
+
+Without that capability — no neighbour plugin, an older release, or a refused
+call — reclamation falls back to the documented interrupt sequence: interrupt the
+session, wait (bounded) for it to settle, switch to the free model, then admit one
+invisible synthetic continuation. The TUI path is unaffected either way; the
+headless limitation applies only to that fallback.
 
 Reclamation only runs when the free model is **confirmed** healthy by a probe. It
 never guesses, and it is disabled by `parkPreemption: false`.
