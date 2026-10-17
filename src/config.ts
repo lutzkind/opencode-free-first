@@ -59,6 +59,13 @@ export interface FreeFirstConfig {
    * passive recovery already covers the case.
    */
   readonly probeUnsupportedBackoffMs: number;
+  /**
+   * How long the free route stays off after OpenCode's own free-tier
+   * eligibility gate refused a real model request. The gate carries no
+   * provider reset, so this is the bounded window before the existing recovery
+   * path may test the free route again through a real request.
+   */
+  readonly routeRejectRetryMs: number;
   /** How long a prepared-but-undispatched request counts as parked. */
   readonly parkGraceMs: number;
   /** Window in which a model selection is attributed to this plugin. */
@@ -98,6 +105,7 @@ export const DEFAULT_CONFIG: FreeFirstConfig = {
   probePrompt: "Reply with the single word: pong",
   probeMaxTokens: 8,
   probeUnsupportedBackoffMs: 21_600_000,
+  routeRejectRetryMs: 300_000,
   parkGraceMs: 5_000,
   switchConfirmMs: 10_000,
   continuationText: DEFAULT_CONTINUATION_TEXT,
@@ -266,6 +274,14 @@ function buildConfig(raw: Record<string, unknown>): FreeFirstConfig {
   if (probeUnsupportedBackoffMs !== undefined) {
     config.probeUnsupportedBackoffMs = probeUnsupportedBackoffMs;
   }
+
+  const routeRejectRetryMs = boundedNumber(
+    raw.routeRejectRetryMs,
+    "routeRejectRetryMs",
+    1_000,
+    86_400_000,
+  );
+  if (routeRejectRetryMs !== undefined) config.routeRejectRetryMs = routeRejectRetryMs;
 
   const parkGraceMs = boundedNumber(raw.parkGraceMs, "parkGraceMs", 500, 600_000);
   if (parkGraceMs !== undefined) config.parkGraceMs = parkGraceMs;

@@ -3,11 +3,18 @@
  *
  * A single small state machine:
  *
- *   FREE_HEALTHY  -- genuine rate limit -->  FREE_COOLDOWN
+ *   FREE_HEALTHY  -- genuine rate limit -->  FREE_COOLDOWN (reason: rate-limit)
+ *   FREE_HEALTHY  -- free-route gate    -->  FREE_COOLDOWN (reason: free-route)
  *   FREE_COOLDOWN -- cooldown reached   -->  FREE_PROBE
  *   FREE_PROBE    -- success            -->  FREE_HEALTHY
  *   FREE_PROBE    -- rate limited       -->  FREE_COOLDOWN (level + 1)
  *   FREE_PROBE    -- inconclusive       -->  FREE_HEALTHY (unconfirmed)
+ *
+ * Both causes share this one mechanism because both mean the same thing — the
+ * free route cannot service a request right now. `cooldownReason` keeps the
+ * diagnosis honest: a genuine rate limit carries the ladder, the reset source,
+ * and `lastRateLimit*`, while OpenCode's free-tier gate arms the same cooldown
+ * for `routeRejectRetryMs` without touching any rate-limit bookkeeping.
  *
  * An inconclusive probe means *unknown*, never *limited*: it re-arms the probe
  * on a bounded schedule but must never keep the free model blocked, because a
@@ -19,7 +26,7 @@
  * reload cannot lose or duplicate a cooldown.
  */
 
-import type { FreeState, HealthRecord, ResetSource } from "./types.js";
+import type { CooldownReason, FreeState, HealthRecord, ResetSource } from "./types.js";
 import { HEALTH_SCHEMA_VERSION } from "./types.js";
 
 export interface HealthOptions {
@@ -111,11 +118,13 @@ export function applyLimited(
       scope: health.scope,
       state: "FREE_COOLDOWN",
       cooldownUntil: until,
+      cooldownReason: "rate-limit",
       level: Math.min(level + 1, Math.max(0, input.options.backoffMs.length)),
       lastRateLimitAt: input.now,
       lastRateLimitType: input.reason,
       lastResetSource: source,
       ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+      ...(health.routeRejectedAt === undefined ? {} : { routeRejectedAt: health.routeRejectedAt }),
       // A new limit says nothing new about whether the probe path itself works,
       // so the probe verdict survives it. Otherwise a structurally refused
       // probe would be retried on every single limit cycle.
@@ -146,6 +155,7 @@ export function markHealthy(health: HealthRecord, now: number): HealthRecord {
     inconclusiveProbes: 0,
     lastProbeOutcome: undefined,
     ...(health.lastRateLimitAt === undefined ? {} : { lastRateLimitAt: health.lastRateLimitAt }),
+    ...(health.routeRejectedAt === undefined ? {} : { routeRejectedAt: health.routeRejectedAt }),
     ...(health.lastRateLimitType === undefined
       ? {}
       : { lastRateLimitType: health.lastRateLimitType }),
@@ -163,6 +173,71 @@ export function extendCooldown(
   readonly cooldownMs: number;
 } {
   return applyLimited(health, input);
+}
+
+export interface FreeRouteUnavailableInput {
+  readonly now: number;
+  /** Bounded window before the free route may be tested again. */
+  readonly retryMs: number;
+}
+
+/**
+ * Arm the shared cooldown because OpenCode's own free-tier eligibility gate
+ * answered a real model request.
+ *
+ * This is deliberately the *same* cooldown mechanism as a rate limit, because
+ * the consequence is the same: the free route cannot service a request until
+ * the window elapses, and the existing recovery path then tests it through a
+ * real request. It is not a rate limit, so it must not masquerade as one:
+ * nothing in the rate-limit bookkeeping is touched — no ladder advance, no
+ * `lastRateLimitAt`/`lastRateLimitType`, no reset source — and the reason is
+ * recorded as `free-route`.
+ *
+ * A duplicate signal inside a live rejection keeps the first
+ * `routeRejectedAt` (one episode, however many sessions observed it) and never
+ * extends the window. A live cooldown from a genuine rate limit is never
+ * shortened: the later deadline wins.
+ */
+export function applyFreeRouteUnavailable(
+  health: HealthRecord,
+  input: FreeRouteUnavailableInput,
+): { readonly health: HealthRecord; readonly retryMs: number } {
+  const retryMs = Number.isFinite(input.retryMs) ? Math.max(1_000, input.retryMs) : 60_000;
+  const duplicate =
+    health.state === "FREE_COOLDOWN" &&
+    health.cooldownReason === "free-route" &&
+    (health.cooldownUntil ?? 0) > input.now;
+  // Never shorten a cooldown that is already running: the later deadline wins.
+  const until = duplicate
+    ? (health.cooldownUntil as number)
+    : Math.max(health.cooldownUntil ?? 0, input.now + retryMs);
+  return {
+    health: {
+      schemaVersion: HEALTH_SCHEMA_VERSION,
+      scope: health.scope,
+      state: "FREE_COOLDOWN",
+      cooldownUntil: until,
+      cooldownReason: "free-route",
+      routeRejectedAt: duplicate ? (health.routeRejectedAt ?? input.now) : input.now,
+      level: health.level,
+      ...(health.lastRateLimitAt === undefined ? {} : { lastRateLimitAt: health.lastRateLimitAt }),
+      ...(health.lastRateLimitType === undefined
+        ? {}
+        : { lastRateLimitType: health.lastRateLimitType }),
+      ...(health.lastResetSource === undefined ? {} : { lastResetSource: health.lastResetSource }),
+      ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+      ...(health.probeBackoffUntil === undefined
+        ? {}
+        : { probeBackoffUntil: health.probeBackoffUntil }),
+      ...(health.inconclusiveProbes === undefined
+        ? {}
+        : { inconclusiveProbes: health.inconclusiveProbes }),
+      ...(health.lastProbeOutcome === undefined
+        ? {}
+        : { lastProbeOutcome: health.lastProbeOutcome }),
+    },
+    retryMs: until - input.now,
+  };
 }
 
 /**
@@ -187,6 +262,7 @@ export function markProbeInconclusive(
       : { lastRateLimitType: health.lastRateLimitType }),
     ...(health.lastResetSource === undefined ? {} : { lastResetSource: health.lastResetSource }),
     ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+    ...(health.routeRejectedAt === undefined ? {} : { routeRejectedAt: health.routeRejectedAt }),
     probeBackoffUntil:
       input.now + (Number.isFinite(input.retryMs) ? Math.max(1_000, input.retryMs) : 60_000),
     inconclusiveProbes: (health.inconclusiveProbes ?? 0) + 1,
@@ -223,6 +299,7 @@ export function clearElapsedCooldown(health: HealthRecord, now: number): HealthR
       : { lastRateLimitType: health.lastRateLimitType }),
     ...(health.lastResetSource === undefined ? {} : { lastResetSource: health.lastResetSource }),
     ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+    ...(health.routeRejectedAt === undefined ? {} : { routeRejectedAt: health.routeRejectedAt }),
     ...(health.probeBackoffUntil === undefined
       ? {}
       : { probeBackoffUntil: health.probeBackoffUntil }),
@@ -312,7 +389,15 @@ export function decodeHealth(value: unknown, scope: string): HealthRecord | unde
     ...(nullableNumber("lastHealthyAt") === undefined
       ? {}
       : { lastHealthyAt: nullableNumber("lastHealthyAt") as number }),
+    ...(isCooldownReason(record.cooldownReason) ? { cooldownReason: record.cooldownReason } : {}),
+    ...(nullableNumber("routeRejectedAt") === undefined
+      ? {}
+      : { routeRejectedAt: nullableNumber("routeRejectedAt") as number }),
   };
+}
+
+function isCooldownReason(value: unknown): value is CooldownReason {
+  return value === "rate-limit" || value === "free-route";
 }
 
 function isResetSource(value: unknown): value is ResetSource {

@@ -243,6 +243,34 @@ export function rateLimitError(overrides = {}) {
   };
 }
 
+/**
+ * OpenCode's own free-tier eligibility gate, shaped exactly as the live
+ * incident delivered it: a 403 authentication-class refusal carrying the free
+ * tier's provenance sentence. A real OpenCode model request is the only place
+ * this classifies as a free-route rejection.
+ */
+export const FREE_ROUTE_GATE_MESSAGE =
+  "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.";
+
+export function freeRouteGateError(overrides = {}) {
+  return {
+    type: "provider.auth",
+    message: FREE_ROUTE_GATE_MESSAGE,
+    status: 403,
+    ...overrides,
+  };
+}
+
+/** An ordinary authentication failure that must never trigger failover. */
+export function authError(overrides = {}) {
+  return {
+    type: "provider.auth",
+    message: "Invalid API key provided",
+    status: 401,
+    ...overrides,
+  };
+}
+
 export function engineOptions(overrides) {
   const clock = overrides.clock ?? new FakeClock();
   const storage = overrides.storage ?? new FakeStorage();
@@ -263,6 +291,7 @@ export function engineOptions(overrides) {
         jitterRatio: 0,
         failoverRetryDelayMs: 100,
         duplicateLimitWindowMs: 5_000,
+        routeRejectRetryMs: 3_000,
         probePrompt: "ping",
         parkGraceMs: 1_000,
         sessionLimit: 50,

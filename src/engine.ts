@@ -13,10 +13,16 @@
  * tests with no provider traffic.
  */
 
-import type { ProbeOutcome, ProviderErrorView, ResetHint } from "./classify.js";
-import { classifyFreeLimit, classifyProbeFailure, extractReset } from "./classify.js";
+import type { FreeRouteRejection, ProbeOutcome, ProviderErrorView, ResetHint } from "./classify.js";
+import {
+  classifyFreeLimit,
+  classifyFreeRouteRejection,
+  classifyProbeFailure,
+  extractReset,
+} from "./classify.js";
 import type { FreeFirstConfig } from "./config.js";
 import {
+  applyFreeRouteUnavailable,
   applyLimited,
   backoffFor,
   clearElapsedCooldown,
@@ -144,6 +150,10 @@ export interface EngineStatus {
   readonly lastRateLimitType?: string;
   readonly lastResetSource?: string;
   readonly lastHealthyAt?: number;
+  /** Why the current cooldown was armed: a rate limit or the free-route gate. */
+  readonly cooldownReason?: string;
+  /** First recognised free-route rejection of the current episode. */
+  readonly routeRejectedAt?: number;
   readonly probedAt?: number;
   readonly probeBackoffUntil?: number;
   readonly inconclusiveProbes?: number;
@@ -586,22 +596,120 @@ export class FreeFirstEngine {
     }
     if (!this.#isPrimary(input.model)) return;
 
+    const state = this.#stateFor(input.sessionID);
+    const now = this.#clock.now();
     const classification = classifyFreeLimit(input.error);
+    let trigger = "failover";
     if (!classification.limited) {
-      if (this.#logger.enabled("debug")) {
-        this.#log("debug", "provider failure is not a free-model rate limit", {
-          sessionID: input.sessionID,
-          type: input.error.type ?? "unknown",
-          status: input.error.status ?? 0,
-          classification: classification.reason,
-          attempt: input.attempt,
-        });
+      // Not a rate limit. The one other cause this plugin acts on is OpenCode's
+      // own free-tier eligibility gate; a 401, a generic 403, an invalid key,
+      // or a configuration error must never reach the failover below.
+      const rejection = classifyFreeRouteRejection(input.error);
+      if (!rejection.rejected) {
+        if (this.#logger.enabled("debug")) {
+          this.#log("debug", "provider failure is not a free-model rate limit", {
+            sessionID: input.sessionID,
+            type: input.error.type ?? "unknown",
+            status: input.error.status ?? 0,
+            classification: classification.reason,
+            attempt: input.attempt,
+          });
+        }
+        return;
       }
+      await this.#recordFreeRouteUnavailable(input, rejection, now);
+      trigger = "route-reject-failover";
+    } else {
+      await this.#recordRateLimit(input, classification, now);
+    }
+    // A compaction request cannot change its model when OpenCode retries it: the
+    // compaction re-sends the request it prepared. Retrying it on the free model
+    // after that model just limited would only spend more doomed free requests,
+    // and would expose the same failure again. A primary request is different —
+    // the runner re-resolves it for the retried attempt — so it keeps the retry.
+    const dispatched = this.#lastDispatch.get(input.sessionID);
+    const fixedModel =
+      dispatched !== undefined &&
+      dispatched.kind === "compaction" &&
+      sameModel(dispatched.model, input.model) &&
+      now - dispatched.at <= COMPACTION_RETRY_WINDOW_MS;
+    if (fixedModel) {
+      this.#compactionRetriesSuppressed += 1;
+      this.#log(
+        "info",
+        trigger === "failover"
+          ? "compaction request is not retried on a just-limited free model"
+          : "compaction request is not retried on a free route that just rejected it",
+        {
+          sessionID: input.sessionID,
+          model: modelRefKey(input.model),
+          dispatchKind: dispatched?.kind,
+        },
+      );
+    }
+
+    if (state.optOut !== undefined) {
+      // The user pointed this session at another model. The limit is real and the
+      // cooldown is shared, but moving this session is not free-first's call.
+      this.#log("info", "session is not managed by free-first; leaving its model unchanged", {
+        sessionID: input.sessionID,
+        optOut: state.optOut,
+      });
+      if (fixedModel) input.decision = { retry: false };
+      this.#schedule();
       return;
     }
 
-    const state = this.#stateFor(input.sessionID);
-    const now = this.#clock.now();
+    const fallback = await this.#resolveFallback(input.sessionID, state.model);
+    if (fallback === undefined) {
+      // Nothing to fail over to. Surfacing the real error beats retrying a free
+      // model that just refused the request.
+      this.#log("error", "no fallback model available; surfacing the free-model failure", {
+        sessionID: input.sessionID,
+      });
+      input.decision = { retry: false };
+      this.#schedule();
+      return;
+    }
+
+    try {
+      await this.#switch(input.sessionID, this.#withVariant(fallback, state.model), trigger);
+      state.managed = true;
+      state.route = "FALLBACK";
+      state.model = fallback;
+      state.updatedAt = now;
+      this.#markDirty();
+      input.decision = fixedModel
+        ? { retry: false }
+        : { retry: true, delay: this.#config.failoverRetryDelayMs };
+      this.#log("info", "fallback selected", {
+        sessionID: input.sessionID,
+        model: modelRefKey(fallback),
+        trigger,
+        retryDelayMs: fixedModel ? undefined : this.#config.failoverRetryDelayMs,
+      });
+    } catch (error) {
+      this.#log("error", "failed to switch session to the fallback model", {
+        sessionID: input.sessionID,
+        model: modelRefKey(fallback),
+      });
+      this.#onError(error);
+      input.decision = { retry: false };
+    }
+    // The cooldown is now authoritative here, so every managed session this
+    // instance knows stops being represented on the free model immediately
+    // instead of at its next hook. That is what keeps an automatic compaction
+    // from resolving the free model at a step boundary.
+    await this.#enforceCooldownRouting("cooldown-guard");
+    this.#schedule();
+  }
+
+  /** Record a genuine rate limit on the shared health record. */
+  async #recordRateLimit(
+    input: RetryInput,
+    classification: { readonly kind?: string; readonly reason: string },
+    now: number,
+  ): Promise<void> {
     // Another free-first instance (OpenCode loads one per location) may already
     // have recorded this provider window. Adopting it keeps the ladder and the
     // cooldown shared instead of each location discovering the limit alone.
@@ -631,6 +739,7 @@ export class FreeFirstEngine {
       this.#health = {
         ...this.#health,
         state: "FREE_COOLDOWN",
+        cooldownReason: "rate-limit",
         ...(until === undefined ? {} : { cooldownUntil: until }),
       };
       this.#markDirty();
@@ -643,104 +752,79 @@ export class FreeFirstEngine {
         duplicate: true,
         cooldown: formatDuration(remainingCooldown(this.#health, now)),
       });
-    } else {
-      const applied = applyLimited(this.#health, {
-        now,
-        ...(reset === undefined ? {} : { reset }),
-        reason: `failover-${classification.reason}`,
-        options: this.#config,
-        random: this.#random,
-      });
-      this.#health = applied.health;
-      this.#markDirty();
-      this.#log("info", "free rate limit detected", {
+      return;
+    }
+    const applied = applyLimited(this.#health, {
+      now,
+      ...(reset === undefined ? {} : { reset }),
+      reason: `failover-${classification.reason}`,
+      options: this.#config,
+      random: this.#random,
+    });
+    this.#health = applied.health;
+    this.#markDirty();
+    this.#log("info", "free rate limit detected", {
+      sessionID: input.sessionID,
+      kind: classification.kind ?? "rate-limit",
+      classification: classification.reason,
+      status: input.error.status ?? 0,
+      attempt: input.attempt,
+      resetSource: applied.source,
+      cooldown: formatDuration(applied.cooldownMs),
+    });
+    this.#log("info", "cooldown started", {
+      until: this.#health.cooldownUntil,
+      level: this.#health.level,
+    });
+  }
+
+  /**
+   * Record OpenCode's free-tier eligibility gate on a real model request.
+   *
+   * The existing shared cooldown is armed with `reason: free-route`, so every
+   * session and instance routes from it until the bounded retry window elapses,
+   * and the existing recovery path then tests the free route through a real
+   * request. The first conclusive rejection establishes the episode; a
+   * duplicate while the window is live keeps its start time and never extends
+   * it, so a herd of sessions cannot turn the gate into a schedule the provider
+   * never gave.
+   */
+  async #recordFreeRouteUnavailable(
+    input: RetryInput,
+    rejection: FreeRouteRejection,
+    now: number,
+  ): Promise<void> {
+    await this.#adoptPersistedCooldown();
+    const duplicate =
+      this.#health.state === "FREE_COOLDOWN" &&
+      this.#health.cooldownReason === "free-route" &&
+      inCooldown(this.#health, now);
+    if (duplicate) {
+      this.#log("info", "free route rejected", {
         sessionID: input.sessionID,
-        kind: classification.kind ?? "rate-limit",
-        classification: classification.reason,
+        classification: rejection.reason,
+        type: input.error.type ?? "unknown",
         status: input.error.status ?? 0,
         attempt: input.attempt,
-        resetSource: applied.source,
-        cooldown: formatDuration(applied.cooldownMs),
+        duplicate: true,
+        since: this.#health.routeRejectedAt,
       });
-      this.#log("info", "cooldown started", {
-        until: this.#health.cooldownUntil,
-        level: this.#health.level,
-      });
-    }
-
-    // A compaction request cannot change its model when OpenCode retries it: the
-    // compaction re-sends the request it prepared. Retrying it on the free model
-    // after that model just limited would only spend more doomed free requests,
-    // and would expose the same failure again. A primary request is different —
-    // the runner re-resolves it for the retried attempt — so it keeps the retry.
-    const dispatched = this.#lastDispatch.get(input.sessionID);
-    const fixedModel =
-      dispatched !== undefined &&
-      dispatched.kind === "compaction" &&
-      sameModel(dispatched.model, input.model) &&
-      now - dispatched.at <= COMPACTION_RETRY_WINDOW_MS;
-    if (fixedModel) {
-      this.#compactionRetriesSuppressed += 1;
-      this.#log("info", "compaction request is not retried on a just-limited free model", {
-        sessionID: input.sessionID,
-        model: modelRefKey(input.model),
-        dispatchKind: dispatched?.kind,
-      });
-    }
-
-    if (state.optOut !== undefined) {
-      // The user pointed this session at another model. The limit is real and the
-      // cooldown is shared, but moving this session is not free-first's call.
-      this.#log("info", "session is not managed by free-first; leaving its model unchanged", {
-        sessionID: input.sessionID,
-        optOut: state.optOut,
-      });
-      if (fixedModel) input.decision = { retry: false };
-      this.#schedule();
       return;
     }
-
-    const fallback = await this.#resolveFallback(input.sessionID, state.model);
-    if (fallback === undefined) {
-      // Nothing to fail over to. Surfacing the real error beats retrying a free
-      // model that just refused the request.
-      this.#log("error", "no fallback model available; surfacing the free-model failure", {
-        sessionID: input.sessionID,
-      });
-      input.decision = { retry: false };
-      this.#schedule();
-      return;
-    }
-
-    try {
-      await this.#switch(input.sessionID, this.#withVariant(fallback, state.model), "failover");
-      state.managed = true;
-      state.route = "FALLBACK";
-      state.model = fallback;
-      state.updatedAt = now;
-      this.#markDirty();
-      input.decision = fixedModel
-        ? { retry: false }
-        : { retry: true, delay: this.#config.failoverRetryDelayMs };
-      this.#log("info", "fallback selected", {
-        sessionID: input.sessionID,
-        model: modelRefKey(fallback),
-        retryDelayMs: fixedModel ? undefined : this.#config.failoverRetryDelayMs,
-      });
-    } catch (error) {
-      this.#log("error", "failed to switch session to the fallback model", {
-        sessionID: input.sessionID,
-        model: modelRefKey(fallback),
-      });
-      this.#onError(error);
-      input.decision = { retry: false };
-    }
-    // The cooldown is now authoritative here, so every managed session this
-    // instance knows stops being represented on the free model immediately
-    // instead of at its next hook. That is what keeps an automatic compaction
-    // from resolving the free model at a step boundary.
-    await this.#enforceCooldownRouting("cooldown-guard");
-    this.#schedule();
+    const applied = applyFreeRouteUnavailable(this.#health, {
+      now,
+      retryMs: this.#config.routeRejectRetryMs,
+    });
+    this.#health = applied.health;
+    this.#markDirty();
+    this.#log("info", "free route rejected", {
+      sessionID: input.sessionID,
+      classification: rejection.reason,
+      type: input.error.type ?? "unknown",
+      status: input.error.status ?? 0,
+      attempt: input.attempt,
+      retryIn: formatDuration(applied.retryMs),
+    });
   }
 
   /* -------------------------------------------------------------- controls */
@@ -831,6 +915,12 @@ export class FreeFirstEngine {
       ...(this.#health.lastHealthyAt === undefined
         ? {}
         : { lastHealthyAt: this.#health.lastHealthyAt }),
+      ...(this.#health.cooldownReason === undefined
+        ? {}
+        : { cooldownReason: this.#health.cooldownReason }),
+      ...(this.#health.routeRejectedAt === undefined
+        ? {}
+        : { routeRejectedAt: this.#health.routeRejectedAt }),
       ...(this.#probedAt === undefined ? {} : { probedAt: this.#probedAt }),
       ...(this.#health.probeBackoffUntil === undefined
         ? {}
@@ -865,7 +955,12 @@ export class FreeFirstEngine {
     const state = healthState(this.#health, this.#clock.now());
     if (state === "FREE_HEALTHY") return `FREE (${modelRefKey(heuristic)})`;
     const remaining = remainingCooldown(this.#health, this.#clock.now());
-    if (remaining > 0) return `FREE cooldown: ${formatDuration(remaining)}`;
+    if (remaining > 0) {
+      if (this.#health.cooldownReason === "free-route") {
+        return `FREE unavailable: route rejected (retry in ${formatDuration(remaining)})`;
+      }
+      return `FREE cooldown: ${formatDuration(remaining)}`;
+    }
     return "probing FREE";
   }
 
@@ -1261,12 +1356,13 @@ export class FreeFirstEngine {
     const newer = stored.level > this.#health.level;
     const longer = storedCooldown > ownCooldown;
 
-    // A recovery confirmed elsewhere is as authoritative as a limit: without
+    // A recovery confirmed elsewhere is as authoritative as a refusal: without
     // this, a stale local cooldown would outlive the recovery that cleared it.
     const recovered =
       stored.state === "FREE_HEALTHY" &&
       stored.lastHealthyAt !== undefined &&
       stored.lastHealthyAt > (this.#health.lastRateLimitAt ?? 0) &&
+      stored.lastHealthyAt > (this.#health.routeRejectedAt ?? 0) &&
       this.#health.state !== "FREE_HEALTHY";
     if (recovered) {
       this.#health = markHealthy(this.#health, stored.lastHealthyAt);
@@ -1280,7 +1376,8 @@ export class FreeFirstEngine {
     // successful recovery.
     const ourRecoveryAt =
       this.#health.state === "FREE_HEALTHY" ? (this.#health.lastHealthyAt ?? 0) : 0;
-    if (ourRecoveryAt > (stored.lastRateLimitAt ?? 0)) return;
+    const storedBlockAt = Math.max(stored.lastRateLimitAt ?? 0, stored.routeRejectedAt ?? 0);
+    if (ourRecoveryAt > storedBlockAt) return;
     // Probe bookkeeping is shared too: an instance that just backed the probe off
     // must not be probed again immediately by every other instance.
     const storedBackoff = stored.probeBackoffUntil ?? 0;
@@ -1308,7 +1405,16 @@ export class FreeFirstEngine {
           ? { lastProbeOutcome: stored.lastProbeOutcome }
           : {}),
       ...(storedCooldown > now
-        ? { state: "FREE_COOLDOWN" as const, cooldownUntil: storedCooldown }
+        ? {
+            state: "FREE_COOLDOWN" as const,
+            cooldownUntil: storedCooldown,
+            ...(stored.cooldownReason === undefined
+              ? {}
+              : { cooldownReason: stored.cooldownReason }),
+            ...(stored.routeRejectedAt === undefined
+              ? {}
+              : { routeRejectedAt: stored.routeRejectedAt }),
+          }
         : {}),
       ...(stored.lastRateLimitAt === undefined
         ? {}
@@ -1549,6 +1655,10 @@ export class FreeFirstEngine {
     // No probe: the next real model call is the test, so move the waiting
     // sessions back to the free model and let traffic confirm recovery.
     if (this.#config.passiveRecovery) {
+      // The elapsed cooldown must leave the record here too: otherwise it keeps
+      // reporting FREE_PROBE and keeps waking the scheduler for a boundary that
+      // is already behind us.
+      this.#normaliseElapsedCooldown();
       await this.#preemptParkedSessions();
       for (const sessionID of this.#fallbackSessions()) {
         await this.#upgrade(sessionID, "passive-recovery");

@@ -41,6 +41,51 @@ Every decision is also logged with the `[opencode-free-first]` prefix. Set
   `adoptFallbackSessions` is `true`. That is deliberate: free-first does not move
   a session you left on a paid route by default.
 
+## "OpenCode's free tier can only be used from within OpenCode"
+
+This gate is OpenCode's own free-tier eligibility check refusing a real model
+request, and legitimate OpenCode users receive it too. It is not a rate limit and
+not a credential problem. The plugin classifies the exact message as a free-route
+rejection, arms the shared cooldown with `cooldownReason: "free-route"`, moves the
+affected session to the fallback for the same turn, and returns it to the free
+model once the route works again. You should see:
+
+```
+[opencode-free-first] free route rejected { classification: "free-tier-provenance-gate", type: "provider.auth", status: 403, retryIn: "5m" }
+[opencode-free-first] model transition { trigger: "route-reject-failover", model: "<fallback>" }
+[opencode-free-first] fallback selected { … trigger: "route-reject-failover", retryDelayMs: 250 }
+```
+
+and later, when the window expires, either
+`recovery probe succeeded` / `returned to free model`, or the passive path
+(`the recovery probe is not permitted for this model; using passive recovery` is
+the normal probe refusal described below, not a new failure).
+
+`status` shows the cause while the window is active:
+
+- `state: "FREE_COOLDOWN"`, `cooldownReason: "free-route"`, `routeRejectedAt`
+  (when the first rejection of the episode was seen) and `cooldownMs` (the
+  remaining retry window).
+- No `lastRateLimitAt` / `lastRateLimitType` / `lastResetSource`: the plugin never
+  reports this as a rate limit.
+- The status line reads `FREE unavailable: route rejected (retry in 5m)`.
+
+If it keeps happening for hours, that is an upstream outage of the free route; the
+plugin keeps managed work on the fallback and retries conservatively
+(`routeRejectRetryMs`, default 5 minutes). Lower it if you would rather test the
+free route more often, raise it if you would rather spend fewer requests on a
+route that is known to be refusing.
+
+A *generic* 401 or 403 (an invalid API key, a forbidden account, a malformed
+request) is deliberately **not** this. Those stay visible, the plugin does not
+fail over, and the underlying error is surfaced unchanged.
+
+Note that a session's automatic *title* request is not covered by the retry hook:
+OpenCode generates titles on its own path and swallows failures there, so a gate
+that happens to hit only the title request leaves the title missing and the turn
+runs normally. The failover covers the agent loop and compaction requests, which
+are the requests that carry the turn.
+
 ## A rate limit is hit but the session does not fail over
 
 Check the debug log for one of these:
@@ -153,9 +198,11 @@ in the sessions.
 
 Use `status().transitions`. A healthy free period records **zero** transitions. A
 complete free-limit cycle records exactly two: `failover` and one of
-`probe-recovery` / `passive-recovery` / `park-preemption`. Anything more means a
-repeated limit is being signalled faster than the cooldown, which the debug log
-shows as `duplicate: true` on the second `free rate limit detected`.
+`probe-recovery` / `passive-recovery` / `park-preemption`. A free-route rejection
+cycle is the same shape with the `route-reject-failover` trigger. Anything more
+means a repeated refusal is being signalled faster than the cooldown, which the
+debug log shows as `duplicate: true` on the second `free rate limit detected` (or
+on the second `free route rejected`).
 
 ## Two plugin instances, or a stale version
 

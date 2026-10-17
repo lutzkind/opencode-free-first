@@ -3,6 +3,88 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] — 2026-10-17
+
+### Fixed
+
+- **OpenCode's own free-tier eligibility gate no longer kills a turn.** When the
+  gateway answered a real model request with
+  `OpenCode's free tier can only be used from within OpenCode. Download it at
+  https://opencode.ai and keep building.` (observed live on 2026-10-17, arriving
+  as a `provider.auth` failure with HTTP 403), the refusal was left to surface as
+  an authentication error: every affected session stopped, and the plugin never
+  switched to the configured fallback. The gate is now recognised on a real model
+  request (agent loop, title, or compaction), the shared cooldown is armed with
+  `cooldownReason: "free-route"`, and the same session and turn continue on the
+  fallback model with one cheap retry — exactly the failover path a rate limit
+  already used.
+
+  The incident is a *route* problem, not a rate limit and not a credential
+  problem, so the two must not be confused in either direction. Detection is the
+  gate's own sentence and nothing else: a generic 401/403, an invalid API key, an
+  unsupported provider, or a malformed request keeps its real failure type, does
+  not fail over, and stays visible. A `free-route` cooldown never advances the
+  backoff ladder and never writes `lastRateLimitAt`/`lastRateLimitType`/
+  `lastResetSource`; `status` and the status line report the route rejection, not
+  a rate-limit cooldown.
+
+  A rate limit and a free-route refusal share the existing cooldown mechanism
+  because the consequence is identical, and because that reuse is what gives the
+  new cause cross-instance adoption, the cooldown-routing guard, and the existing
+  recovery path for free. The gate carries no provider reset, so the window is
+  `routeRejectRetryMs` (default 5 minutes, configurable). The first conclusive
+  rejection establishes the episode: every executing managed session is moved to
+  its fallback immediately, and a duplicate refusal from another session neither
+  restarts the episode nor extends the window, so a herd cannot turn the gate
+  into a schedule the provider never gave.
+
+  The out-of-band recovery probe keeps its existing handling: the same sentence on
+  `ctx.generate.text` is a *probe-path* refusal (`unsupported`), backed off for
+  `probeUnsupportedBackoffMs`, with recovery continuing passively. Only a real
+  model request is a free-route rejection, and a refused probe can therefore never
+  suppress a real session failure.
+
+- **Passive recovery drops the elapsed cooldown from the record.** With
+  `"probe": false` the passive branch returned the waiting sessions to the free
+  model but left the elapsed `FREE_COOLDOWN` in the record, so `status` kept
+  reporting `FREE_PROBE` and the scheduler kept re-arming a wake-up that was
+  already due. It now normalises the record exactly as the probe branch does.
+
+### Added
+
+- `classifyFreeRouteRejection`, a narrow classifier for OpenCode's free-tier
+  eligibility gate on a real model request, exported from `./core` with
+  `applyFreeRouteUnavailable`.
+- `HealthRecord.cooldownReason` (`"rate-limit" | "free-route"`) and
+  `HealthRecord.routeRejectedAt`, plus the matching `status()` fields, so an audit
+  can tell a genuine rate limit from a temporarily unavailable free route and can
+  see when the episode started.
+- `routeRejectRetryMs` configuration (default `300000`, 5 minutes, bounded
+  1 000–86 400 000 ms).
+- The status line reports `FREE unavailable: route rejected (retry in 5m)` while a
+  free-route cooldown is active.
+- `model transition` entries use the `route-reject-failover` trigger for this
+  cause, so switch-churn debugging names it.
+- 11 unit tests for the classification boundary, the shared episode, failover,
+  recovery, restart/cross-instance adoption and the health record, plus 3 live
+  CLI cases: the gate fails the same turn over with no duplicated prompt and no
+  repeated doomed free request; the existing recovery path returns the session to
+  the free model once the gate clears (asserted through the plugin's own `status`
+  RPC); and a generic 401 still stops visibly with zero paid requests.
+
+### Documentation
+
+- `ARCHITECTURE.md`, `DECISIONS.md` (025–027), `README.md`,
+  `docs/state-machine.md`, `docs/configuration.md` and `docs/troubleshooting.md`
+  now state the three-way distinction explicitly: rate limited ≠ free-route
+  rejected ≠ auth/config failure.
+
+### Evidence
+
+- 234 unit tests, 14 integration cases (real `opencode` CLI, real
+  `opencode-offpeak`, deterministic mock provider), `opencode-offpeak` regression
+  suite, `npm run lint`, `npm run typecheck`, and `npm pack --dry-run` all pass.
+
 ## [0.1.8] — 2026-10-16
 
 ### Fixed
@@ -253,6 +335,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.9]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.9
 [0.1.8]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.8
 [0.1.7]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.7
 [0.1.6]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.6

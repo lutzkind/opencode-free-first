@@ -113,14 +113,14 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     jitterRatio: 0,
     failoverRetryDelayMs: 50,
     parkGraceMs: 1_200,
+    // A free-route rejection is retried conservatively; short here so the case
+    // can observe the recovery without waiting minutes.
+    routeRejectRetryMs: 1_500,
     // A distinctive probe prompt lets the mock gate exactly the probe.
     probePrompt: "FF_PROBE_PROBE_ONLY",
     logLevel: "debug",
   };
-  const coexistencePlugins = [
-    OFFPEAK_SPEC,
-    { package: repo, options: freeFirstOptions },
-  ];
+  const coexistencePlugins = [OFFPEAK_SPEC, { package: repo, options: freeFirstOptions }];
 
   function offpeakConfig(policy) {
     writeJson(path.join(home, "config", "opencode", "offpeak.json"), {
@@ -149,6 +149,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       retryAfterSeconds: undefined,
       delayMs: 0,
       gateProbe: false,
+      onlyWithTools: false,
     };
     await fetch(`http://127.0.0.1:${port}/__control`, {
       method: "POST",
@@ -637,6 +638,209 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     assert.ok(
       state.log.filter((entry) => entry.event === "request" && entry.role === "free").length >= 3,
       "the free model was used again after the cooldown",
+    );
+  });
+
+  it("Case 12 — the free-tier gate fails the same turn over and never repeats the doomed call", async () => {
+    // The live incident (2026-10-17): OpenCode's own free-tier eligibility gate
+    // ("OpenCode's free tier can only be used from within OpenCode") answered a
+    // real model request, and every session died because the refusal was left
+    // to surface as an authentication failure. The gate is served exactly once
+    // and the free role then works, which is the upstream recovery this plugin
+    // must ride out.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "free-tier-gate", failFirst: 1, onlyWithTools: true },
+      paid: { mode: "ok" },
+    });
+    const answerOf = (messages) =>
+      messages
+        .filter((message) => message.type === "assistant")
+        .flatMap((message) => message.data?.content ?? [])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join(" ");
+    const result = await run("Reply with the word READY");
+    assertOk(result);
+
+    assert.match(result.stdout, /free route rejected/);
+    assert.match(result.stdout, /fallback selected/);
+    assert.match(result.stdout, /model transition/);
+    assert.doesNotMatch(result.stdout, /provider failure is not a free-model rate limit/);
+    assert.match(result.stdout, /MOCK_OK model=ff-paid/, "the task finished on the fallback");
+
+    const state = await mockState();
+    const gated = state.log.filter(
+      (entry) => entry.event === "error-response" && entry.gate === true,
+    );
+    assert.equal(gated.length, 1, "the free route was refused exactly once for this incident");
+    assert.equal(gated[0].status, 403);
+    assert.match(gated[0].message, /free tier can only be used from within OpenCode/);
+
+    const requests = state.log.filter((entry) => entry.event === "request");
+    const paid = requests.filter((entry) => entry.role === "paid");
+    assert.ok(paid.length >= 1, "exactly the failed turn continued on the fallback");
+    assert.equal(
+      state.log.filter((entry) => entry.event === "error-response").length,
+      1,
+      "no session re-spent a rejected free request",
+    );
+
+    // The session survived: one user message, no synthetic continuation, and
+    // the failed turn was retried on the fallback without a second session.
+    const record = transcript();
+    assert.equal(record.sessions.length, 1, "the same session finished the turn");
+    assert.equal(
+      record.messages.filter((message) => message.type === "user").length,
+      1,
+      "the prompt was never duplicated",
+    );
+    assert.equal(record.model?.id, "ff-paid");
+    assert.equal(answerOf(record.messages), "MOCK_OK model=ff-paid");
+  });
+
+  it("Case 13 — the free route returns automatically once the gate clears", async () => {
+    // The gate is transient upstream: after it clears, the existing recovery
+    // path must return waiting sessions to the free model with no manual
+    // intervention, and the status must show the transition.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "free-tier-gate", failFirst: 1, onlyWithTools: true },
+      paid: { mode: "ok" },
+    });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        title: "free-route-gate",
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      assert.ok(sessionID, `no session id: ${JSON.stringify(created)}`);
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with the word READY",
+      });
+
+      const context = async () =>
+        (await call("GET", `/api/session/${sessionID}/context`))?.data ?? [];
+      const answers = (messages) =>
+        messages.filter(
+          (message) =>
+            message.type === "assistant" &&
+            (message.content ?? []).some(
+              (part) => part.type === "text" && String(part.text ?? "").includes("MOCK_OK"),
+            ),
+        );
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (answers(await context()).length >= 1) break;
+      }
+
+      const rpc = async () =>
+        (
+          await call("POST", "/api/rpc/opencode-free-first/control", {
+            input: { action: "status" },
+          })
+        )?.output?.status ?? {};
+
+      const during = await rpc();
+      const first = answers(await context());
+      assert.equal(first.length, 1, "the first turn was answered exactly once");
+      assert.match(
+        first[0].content.map((part) => part.text ?? "").join(""),
+        /MOCK_OK model=ff-paid/,
+      );
+
+      // Wait for the bounded retry window and the existing recovery path.
+      let after;
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        after = await rpc();
+        if (after.state === "FREE_HEALTHY" && after.fallbackSessions === 0) break;
+      }
+
+      // The recovered route must actually serve the next turn.
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with the word READY",
+      });
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (answers(await context()).length >= 2) break;
+      }
+      const session = (await call("GET", `/api/session/${sessionID}`))?.data;
+      return { during, after, messages: await context(), session, sessionID };
+    });
+
+    assert.equal(outcome.during.state, "FREE_COOLDOWN");
+    assert.equal(
+      outcome.during.cooldownReason,
+      "free-route",
+      "the status names the free-route cause, not a rate limit",
+    );
+    assert.equal(outcome.during.lastRateLimitAt, undefined, "no rate-limit metadata was invented");
+    assert.match(outcome.during.status, /route rejected/);
+    assert.equal(outcome.after.state, "FREE_HEALTHY", "recovery returned the route to FREE");
+    assert.equal(outcome.after.cooldownReason, undefined);
+    assert.equal(outcome.after.fallbackSessions, 0);
+    assert.equal(outcome.session?.model?.id, "ff-free", "the session is back on the free model");
+
+    const answers = outcome.messages.filter(
+      (message) =>
+        message.type === "assistant" &&
+        (message.content ?? []).some(
+          (part) => part.type === "text" && String(part.text ?? "").includes("MOCK_OK"),
+        ),
+    );
+    assert.equal(answers.length, 2, "each turn was answered exactly once");
+    assert.match(
+      answers[1].content.map((part) => part.text ?? "").join(""),
+      /MOCK_OK model=ff-free/,
+      "the second turn ran on the recovered free route",
+    );
+    assert.equal(
+      outcome.messages.filter((message) => message.type === "user").length,
+      2,
+      "no continuation input was injected",
+    );
+
+    const state = await mockState();
+    assert.equal(
+      state.log.filter((entry) => entry.event === "error-response" && entry.gate === true).length,
+      1,
+      "only the first free request was refused",
+    );
+    assert.ok(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "free").length >= 3,
+      "the free route was used again after the gate cleared",
+    );
+  });
+
+  it("Case 14 — a provider auth failure stops visibly instead of failing over", async () => {
+    // The distinction the whole classification rests on: a generic auth error
+    // is an operator problem, not a free-route problem, so the plugin must not
+    // move the session to the paid route and must not hide the failure.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "401" },
+      paid: { mode: "ok" },
+    });
+    const result = await run("Reply with the word READY");
+    assert.notEqual(result.status, 0, "the run failed instead of silently continuing");
+    assert.doesNotMatch(result.stdout, /fallback selected/);
+    assert.doesNotMatch(result.stdout, /free route rejected/);
+    assert.match(result.stdout, /mock error 401|authentication|unauthorized/i);
+
+    const state = await mockState();
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "paid").length,
+      0,
+      "no paid request was made for an authentication failure",
     );
   });
 

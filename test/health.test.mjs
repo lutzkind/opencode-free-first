@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  applyFreeRouteUnavailable,
   applyLimited,
   backoffFor,
   clearElapsedCooldown,
@@ -225,6 +226,101 @@ describe("state transitions", () => {
     assert.equal(healthy.inconclusiveProbes, 0);
     assert.equal(healthy.lastProbeOutcome, undefined);
     assert.equal(healthy.lastHealthyAt, NOW + 1_000);
+  });
+});
+
+describe("free-route unavailability", () => {
+  it("arms the shared cooldown without pretending to be a rate limit", () => {
+    const { health, retryMs } = applyFreeRouteUnavailable(initialHealth(SCOPE, NOW), {
+      now: NOW,
+      retryMs: 300_000,
+    });
+    assert.equal(health.state, "FREE_COOLDOWN");
+    assert.equal(health.cooldownReason, "free-route");
+    assert.equal(health.cooldownUntil, NOW + 300_000);
+    assert.equal(health.routeRejectedAt, NOW);
+    assert.equal(retryMs, 300_000);
+    // Nothing in the rate-limit bookkeeping is touched.
+    assert.equal(health.level, 0);
+    assert.equal(health.lastRateLimitAt, undefined);
+    assert.equal(health.lastRateLimitType, undefined);
+    assert.equal(health.lastResetSource, undefined);
+    assert.equal(inCooldown(health, NOW), true);
+    assert.equal(remainingCooldown(health, NOW), 300_000);
+  });
+
+  it("keeps one episode for a duplicate signal and never extends the window", () => {
+    const first = applyFreeRouteUnavailable(initialHealth(SCOPE, NOW), {
+      now: NOW,
+      retryMs: 300_000,
+    }).health;
+    const duplicate = applyFreeRouteUnavailable(first, {
+      now: NOW + 1_000,
+      retryMs: 300_000,
+    }).health;
+    assert.equal(duplicate.routeRejectedAt, NOW, "the episode start is kept");
+    assert.equal(duplicate.cooldownUntil, first.cooldownUntil, "the window is not extended");
+  });
+
+  it("starts a fresh episode once the previous window has elapsed", () => {
+    const first = applyFreeRouteUnavailable(initialHealth(SCOPE, NOW), {
+      now: NOW,
+      retryMs: 1_000,
+    }).health;
+    const later = applyFreeRouteUnavailable(first, { now: NOW + 5_000, retryMs: 1_000 }).health;
+    assert.equal(later.routeRejectedAt, NOW + 5_000);
+    assert.equal(later.cooldownUntil, NOW + 6_000);
+  });
+
+  it("never shortens a live rate-limit cooldown", () => {
+    const { health: cooling } = applyLimited(initialHealth(SCOPE, NOW), {
+      now: NOW,
+      reset: { until: NOW + 600_000, source: "retry-after" },
+      reason: "test",
+      options: OPTIONS,
+      random: () => 0.5,
+    });
+    const { health } = applyFreeRouteUnavailable(cooling, { now: NOW, retryMs: 300_000 });
+    assert.equal(health.cooldownUntil, NOW + 600_000, "the later deadline wins");
+    assert.equal(health.cooldownReason, "free-route");
+    assert.equal(health.lastRateLimitAt, NOW, "the genuine limit stays recorded");
+  });
+
+  it("returns to healthy when the window elapses and keeps the rejection as history", () => {
+    const { health } = applyFreeRouteUnavailable(initialHealth(SCOPE, NOW), {
+      now: NOW,
+      retryMs: 1_000,
+    });
+    assert.equal(cooldownElapsed(health, NOW + 1_001), true);
+    const cleared = clearElapsedCooldown(health, NOW + 1_001);
+    assert.equal(cleared.state, "FREE_HEALTHY");
+    assert.equal(cleared.cooldownUntil, undefined);
+    assert.equal(cleared.cooldownReason, undefined, "the live cause leaves with the block");
+    assert.equal(cleared.routeRejectedAt, NOW, "the episode start stays for diagnostics");
+    assert.equal(healthState(cleared, NOW + 1_001), "FREE_HEALTHY");
+  });
+
+  it("round-trips the reason and the episode start", () => {
+    const { health } = applyFreeRouteUnavailable(initialHealth(SCOPE, NOW), {
+      now: NOW,
+      retryMs: 300_000,
+    });
+    const decoded = decodeHealth(JSON.parse(JSON.stringify(health)), SCOPE);
+    assert.deepEqual(decoded, health);
+  });
+
+  it("drops corrupt reason metadata without losing the cooldown", () => {
+    const base = limited(initialHealth(SCOPE, NOW)).health;
+    assert.equal(base.cooldownReason, "rate-limit");
+    const badReason = decodeHealth({ ...base, cooldownReason: "something-else" }, SCOPE);
+    assert.equal(badReason.state, "FREE_COOLDOWN");
+    assert.equal(badReason.cooldownUntil, base.cooldownUntil);
+    assert.equal(badReason.cooldownReason, undefined);
+    const badAt = decodeHealth({ ...base, routeRejectedAt: "soon" }, SCOPE);
+    assert.equal(badAt.state, "FREE_COOLDOWN");
+    assert.equal(badAt.cooldownUntil, base.cooldownUntil);
+    assert.equal(badAt.routeRejectedAt, undefined);
+    assert.equal(badAt.cooldownReason, "rate-limit", "the valid field is untouched");
   });
 });
 

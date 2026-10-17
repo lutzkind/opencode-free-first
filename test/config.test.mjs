@@ -79,6 +79,15 @@ describe("validateConfig", () => {
     assert.match(validateConfig({ jitterRatio: 2 }).error, /jitterRatio/);
     assert.match(validateConfig({ maxCooldownMs: -1 }).error, /maxCooldownMs/);
     assert.match(validateConfig({ failoverRetryDelayMs: "fast" }).error, /failoverRetryDelayMs/);
+    assert.match(validateConfig({ routeRejectRetryMs: "soon" }).error, /routeRejectRetryMs/);
+    assert.match(validateConfig({ routeRejectRetryMs: 0 }).error, /routeRejectRetryMs/);
+  });
+
+  it("accepts a free-route retry window", () => {
+    const result = validateConfig({ routeRejectRetryMs: 600_000 });
+    assert.equal(result.error, undefined);
+    assert.equal(result.config.routeRejectRetryMs, 600_000);
+    assert.equal(DEFAULT_CONFIG.routeRejectRetryMs, 300_000);
   });
 
   it("rejects a non-boolean switch", () => {

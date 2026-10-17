@@ -2,8 +2,9 @@
 
 `opencode-free-first` owns one question — *is the configured free model usable
 right now?* — and one consequence: a session that hits a genuine free-tier rate
-limit keeps working on the configured fallback and comes back when the free model
-recovers.
+limit — or OpenCode's own free-tier eligibility gate, which makes the free route
+temporarily unavailable — keeps working on the configured fallback and comes back
+when the free route recovers.
 
 It is deliberately small. There is no provider stack, no proxy, no queue, no
 scheduler for paid work, no daemon, and no second database.
@@ -69,6 +70,7 @@ Two pieces of derived state, both persisted in OpenCode's plugin storage.
   "scope": "opencode/deepseek-v4.1-flash-free",
   "state": "FREE_COOLDOWN",
   "cooldownUntil": 1792079000000,
+  "cooldownReason": "rate-limit",
   "level": 2,
   "lastRateLimitAt": 1792078000000,
   "lastRateLimitType": "failover-http-429",
@@ -78,12 +80,23 @@ Two pieces of derived state, both persisted in OpenCode's plugin storage.
 ```
 
 ```
-FREE_HEALTHY  -- genuine free-model rate limit -->  FREE_COOLDOWN
+FREE_HEALTHY  -- genuine free-model rate limit  -->  FREE_COOLDOWN (reason: rate-limit)
+FREE_HEALTHY  -- OpenCode free-tier gate        -->  FREE_COOLDOWN (reason: free-route)
 FREE_COOLDOWN -- cooldown reached               -->  FREE_PROBE
 FREE_PROBE    -- success                       -->  FREE_HEALTHY
 FREE_PROBE    -- rate limited                  -->  FREE_COOLDOWN (level + 1)
 FREE_PROBE    -- inconclusive                  -->  FREE_COOLDOWN (level kept, short retry)
 ```
+
+A rate limit and a free-route refusal share the cooldown because the consequence
+is identical — the free route cannot service a request — and sharing it is what
+keeps recovery, cross-instance adoption, and the cooldown-routing guard from
+needing a second mechanism. They differ in every other respect, and
+`cooldownReason` is what keeps that distinction visible: a rate limit carries the
+ladder, the reset source, and `lastRateLimit*`; a `free-route` cooldown is armed
+for `routeRejectRetryMs`, records `routeRejectedAt`, and touches none of the
+rate-limit bookkeeping, so diagnostics can never present it as a 429. A live
+cooldown is never shortened by a refusal: the later deadline wins.
 
 `FREE_PROBE` is the derived name for `FREE_COOLDOWN` whose cooldown has elapsed
 and whose health is not yet confirmed; it is not stored, so there is no state
@@ -128,7 +141,7 @@ cannot move a session the user repointed while OpenCode was stopped.
 | `generate` | Bound the recovery probe's output. The probe is best-effort: only a real rate limit may block the free model. |
 | `model.request` | Confirm a request is about to be dispatched — the request is no longer held. |
 | `http.response` | Prove free health from a non-error response; capture reset headers. |
-| `retry` | The failover decision: record the cooldown, switch the model, force one cheap retry. |
+| `retry` | The failover decision: record the cooldown (`rate-limit` or `free-route`), switch the model, force one cheap retry. Anything else stays visible. |
 | `generate` | Bound the recovery probe's output while it is in flight. |
 | `event.subscribe` | `session.execution.started|succeeded|failed|interrupted` and `session.model.selected`. |
 | `rpc.register` | Diagnostics and operator controls. |
@@ -155,11 +168,16 @@ SessionRunner.runStep
 
 So the failover is:
 
-1. A genuine free-model rate limit arrives in the `retry` hook
-   (`error.status === 429`, `provider.rate-limit`, `provider.quota`, or explicit
-   exhaustion wording).
-2. The cooldown is recorded (authoritative reset if the provider gave one, else
-   the ladder with jitter), and the session's model is switched to the fallback.
+1. A refusal arrives in the `retry` hook and is classified. Two causes reach the
+   failover: a genuine free-model rate limit (`error.status === 429`,
+   `provider.rate-limit`, `provider.quota`, or explicit exhaustion wording), and
+   OpenCode's own free-tier eligibility gate (the exact
+   "free tier can only be used from within OpenCode" sentence on a real model
+   request). Everything else — including a generic `401`/`403`, an invalid key,
+   or a configuration error — is left untouched and stays visible.
+2. The cooldown is recorded with its cause: an authoritative reset or the ladder
+   for a rate limit, `routeRejectRetryMs` for the gate. The session's model is
+   switched to the fallback.
 3. `decision = { retry: true, delay: failoverRetryDelayMs }` makes the very next
    attempt happen immediately.
 4. OpenCode re-runs the step, re-resolves the model, and continues the same turn:
@@ -317,13 +335,13 @@ Detection is conservative and ordered:
    (`rate limit exceeded`, `too many requests`, `quota exceeded`,
    `usage limit reached`, `insufficient credits`, …).
 
-The following never count, and keep their real failure type:
+The following never count as a rate limit, and keep their real failure type:
 
 | Signal | Result |
 | --- | --- |
 | `400` / `provider.invalid-request` | not a limit |
-| `401` / `provider.auth` | not a limit |
-| `403` authorization failure | not a limit |
+| `401` / `provider.auth` | not a limit (and never the free-route gate) |
+| `403` authorization failure | not a limit (and never the free-route gate) |
 | `provider.content-filter` | not a limit |
 | malformed context / maximum context length | not a limit |
 | `tool.execution` | not a limit |
@@ -331,6 +349,14 @@ The following never count, and keep their real failure type:
 | `provider.internal` (5xx) | not a limit |
 | `provider.no-route`, `provider.unknown` | not a limit |
 | a plugin bug (`unknown`) | not a limit |
+
+A separate, equally narrow classifier recognises OpenCode's free-tier eligibility
+gate on a real model request: a 4xx provider failure whose message contains the
+gate's own sentence ("free tier can only be used from within OpenCode"). The same
+sentence on the out-of-band probe is a different thing and stays `unsupported`
+(see Recovery). The distinction is asserted both ways in the test suite: the gate
+can never be reached by a generic `403`, and a probe refusal can never be reported
+as a free-route rejection.
 
 A structured non-limit type also wins over a matching phrase, and an explicit
 negation ("the request was not rate limited") is rejected before any positive
@@ -341,6 +367,7 @@ pattern is considered.
 | Situation | Behaviour |
 | --- | --- |
 | Simultaneous 429s across sessions | One cooldown; the backoff ladder advances once per provider window (`duplicateLimitWindowMs`). |
+| Simultaneous free-tier gate refusals across sessions | One cooldown with `reason: free-route`; the first conclusive rejection establishes the episode (`routeRejectedAt`), the cooldown-routing pass moves every executing managed session to its fallback, and a duplicate refusal neither restarts the episode nor extends the window. |
 | A herd reaching cooldown expiry together | One probe; its result is reused for every waiting session. |
 | A probe fails while another session works on the fallback | The working session is never touched. |
 | OpenCode restart during a cooldown | A future cooldown is restored, an expired one is discarded, none is probed at startup. |
@@ -351,8 +378,9 @@ pattern is considered.
 ## Model transitions
 
 Every switch is recorded as `<timestamp> <trigger> -> provider/model`, where the
-trigger is one of `failover`, `prompt-admission`, `context-guard`,
-`passive-recovery`, `probe-recovery`, `park-preemption`, or `cooldown-guard`. The last 40 are
+trigger is one of `failover`, `route-reject-failover`, `prompt-admission`,
+`context-guard`, `passive-recovery`, `probe-recovery`, `park-preemption`, or
+`cooldown-guard`. The last 40 are
 exposed through `status().transitions`, which is what the switch-churn tests
 assert against: a complete free-limit cycle is exactly two transitions.
 

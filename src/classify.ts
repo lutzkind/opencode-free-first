@@ -181,6 +181,51 @@ export function classifyProbeFailure(error: ProviderErrorView | undefined): Prob
   return "inconclusive";
 }
 
+/**
+ * The free-route eligibility gate as it arrives on a *real* OpenCode model
+ * request (the agent loop, a title, or a compaction): OpenCode's gateway
+ * refuses to serve the free model and states that free use is only permitted
+ * from inside OpenCode, which is a transient upstream condition (legitimate
+ * OpenCode users receive it too).
+ *
+ * This is classified separately from a rate limit for diagnosis and recovery:
+ *
+ *   - a genuine 429/quota signal is a *rate limit*: the ladder, the provider's
+ *     reset metadata, and the rate-limit bookkeeping all apply;
+ *   - this gate makes the free *route* temporarily unavailable: the same shared
+ *     cooldown is armed with `reason: free-route`, managed work moves to the
+ *     configured fallback for the bounded retry window, and the existing
+ *     recovery path then tests the free route through a real request;
+ *   - an ordinary 401/403, an invalid key, an unsupported provider/model, or a
+ *     malformed request is an auth-or-config error: it stays visible and never
+ *     triggers failover.
+ *
+ * The match is deliberately exact and scoped to the gate's own sentence, so a
+ * generic authentication failure (including a plain `provider.auth` 403) is
+ * never re-labelled as a free-route problem. `classifyFreeLimit` intentionally
+ * keeps structured non-limit types winning over message phrases; this
+ * classifier is consulted *only* for a real model request and only for this one
+ * recognised gate.
+ */
+export interface FreeRouteRejection {
+  readonly rejected: boolean;
+  /** Stable, loggable explanation of why the verdict was reached. */
+  readonly reason: string;
+}
+
+const FREE_ROUTE_GATE = /free tier can only be used from within opencode\b/i;
+
+export function classifyFreeRouteRejection(
+  error: ProviderErrorView | undefined,
+): FreeRouteRejection {
+  if (error === undefined) return { rejected: false, reason: "no-error" };
+  const message = typeof error.message === "string" ? error.message : "";
+  if (message.length > 0 && FREE_ROUTE_GATE.test(message)) {
+    return { rejected: true, reason: "free-tier-provenance-gate" };
+  }
+  return { rejected: false, reason: "no-free-route-gate" };
+}
+
 export interface ResetHint {
   readonly until: number;
   readonly source: ResetSource;

@@ -34,6 +34,14 @@ export function sameModel(
  */
 export type FreeState = "FREE_HEALTHY" | "FREE_COOLDOWN" | "FREE_PROBE";
 
+/**
+ * Why the free route is currently unavailable. A genuine provider rate limit
+ * (`rate-limit`) and OpenCode's free-tier eligibility gate (`free-route`) are
+ * different causes with the same consequence: they share the one cooldown
+ * mechanism, but diagnostics must never present one as the other.
+ */
+export type CooldownReason = "rate-limit" | "free-route";
+
 /** How a managed session currently routes its model calls. */
 export type SessionRoute = "PRIMARY" | "FALLBACK";
 
@@ -48,12 +56,19 @@ export interface HealthRecord {
   readonly state: FreeState;
   /** Absolute epoch milliseconds. `undefined` when healthy. */
   readonly cooldownUntil?: number | undefined;
+  /** Why the current cooldown was armed: a rate limit or the free-route gate. */
+  readonly cooldownReason?: CooldownReason | undefined;
   /** Backoff ladder position, 0-based. */
   readonly level: number;
   readonly lastRateLimitAt?: number;
   readonly lastRateLimitType?: string;
   readonly lastResetSource?: ResetSource;
   readonly lastHealthyAt?: number;
+  /**
+   * Absolute time of the first recognised free-route rejection of the current
+   * episode, for diagnostics ("route-rejected since when").
+   */
+  readonly routeRejectedAt?: number | undefined;
   /**
    * Absolute time before which the recovery probe must stay quiet. A probe
    * back-off never blocks the free model; it only schedules the next attempt.

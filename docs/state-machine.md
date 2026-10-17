@@ -4,7 +4,8 @@
 
 ```
 FREE_HEALTHY
-    │  genuine free-model rate limit
+    │  genuine free-model rate limit          cooldownReason: "rate-limit"
+    │  OpenCode free-tier eligibility gate    cooldownReason: "free-route"
     ▼
 FREE_COOLDOWN  ── cooldownUntil is an absolute epoch-millisecond timestamp
     │  cooldownUntil <= now
@@ -13,6 +14,12 @@ FREE_PROBE
     ├─ success       ──▶ FREE_HEALTHY                       (recovery confirmed)
     ├─ rate limited  ──▶ FREE_COOLDOWN  (level + 1)          (a real limit)
     └─ inconclusive  ──▶ FREE_HEALTHY   (unconfirmed)        (unknown, never limited)
+
+Both causes arm the *same* cooldown because both mean the same thing: the free
+route cannot service a request right now. The reason keeps them apart. A
+`free-route` cooldown is armed for `routeRejectRetryMs` (no provider reset
+exists), does not touch the ladder or the rate-limit bookkeeping, and is
+reported as a route rejection rather than as a rate limit.
 
 An inconclusive result re-arms the *probe* on a bounded back-off
 (`probeBackoffUntil`) and returns the waiting sessions to the free model, so the
@@ -34,7 +41,9 @@ mid-transition.
 | Prompt admission, free model selected, cooling down | Switch the session to the fallback *before* the turn resolves its model. No request is spent on a model known to be limited. |
 | Request preparation (`context`), free model, cooling down | Safety net for a mid-turn step: switch the session so the next attempt uses the fallback. |
 | Request preparation, fallback model, cooldown elapsed | Delegate to the single recovery path. |
-| Retry hook, free model, genuine limit | Record the cooldown, switch to the fallback, force one cheap retry. |
+| Retry hook, free model, genuine limit | Record the cooldown (`rate-limit`), switch to the fallback, force one cheap retry. |
+| Retry hook, free model, exact free-tier gate | Record the cooldown (`free-route`), switch the same session to the fallback, force one cheap retry. A generic 401/403 or any other auth/config failure is left alone. |
+| Prompt admission or prepare, free model, `free-route` cooldown | Same routing as a rate-limit cooldown: no request is spent on a temporarily refused route. |
 | Response observed, free model, non-error status | Confirmed recovery: clear the cooldown and reset the ladder. |
 | Recovery tick | Probe, then reclaim parked work, then return waiting sessions to the free model. A probe that cannot decide counts as a fail-open outcome, not as a block. |
 
@@ -56,9 +65,10 @@ probe path works.
 ## Elapsed cooldowns
 
 A cooldown whose timestamp has passed is removed from the record on every fail-open
-outcome. Keeping it would make `status` report `FREE_PROBE` and would keep waking
-the scheduler for a boundary already behind us, so an elapsed cooldown is
-normalised away while the ladder position and the probe bookkeeping survive.
+outcome — including the passive recovery branch (probing disabled), which
+otherwise kept reporting `FREE_PROBE` and re-armed a due wake-up in a tight loop.
+An elapsed cooldown is normalised away while the ladder position, the probe
+bookkeeping, and the last rejection time survive.
 
 ## Reset metadata
 
@@ -96,7 +106,7 @@ Used only when no reset metadata exists:
 | 6+ | 15 minutes (last entry repeats) |
 
 - The **level advances on each genuine limit** and resets to zero on confirmed
-  recovery.
+  recovery. A `free-route` cooldown never advances it: it is not a rate limit.
 - `maxCooldownMs` caps a ladder-derived cooldown.
 - `jitterRatio` adds symmetric jitter, clamped so jitter can neither shorten a
   cooldown below the minimum nor extend it past the cap. Symmetric jitter keeps
@@ -155,6 +165,7 @@ a restart cannot move a session the user repointed while OpenCode was stopped.
 | Derived state | `status()` value | Status line |
 | --- | --- | --- |
 | Healthy | `FREE_HEALTHY` | `FREE (provider/model)` |
-| Cooling down | `FREE_COOLDOWN` | `FREE cooldown: 8m` |
+| Rate-limited | `FREE_COOLDOWN` (`cooldownReason: "rate-limit"`) | `FREE cooldown: 8m` |
+| Free route temporarily unavailable | `FREE_COOLDOWN` (`cooldownReason: "free-route"`, `routeRejectedAt` set) | `FREE unavailable: route rejected (retry in 8m)` |
 | Cooldown elapsed, unconfirmed | `FREE_PROBE` | `probing FREE` |
 | Disabled | — | `disabled` |

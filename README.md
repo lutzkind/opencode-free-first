@@ -11,7 +11,7 @@ model once recovery is confirmed — without a second prompt, a manual model
 change, a restart, or any interruption of productive work.
 
 ```
-FREE  →  rate limit  →  fallback  →  cooldown  →  FREE recovery  →  FREE  →  …
+FREE  →  rate limit / free-route gate  →  fallback  →  cooldown  →  FREE recovery  →  FREE  →  …
 ```
 
 Nothing here is a new provider stack, a proxy, a scheduler, or a queue. Real
@@ -47,6 +47,12 @@ stays in charge of *when* paid work runs.
    produces, or explicitly scoped exhaustion wording count. A `400`, a `401`, a
    `500`, a tool failure, a malformed request, a provider outage, or a plugin bug
    keeps its real failure type and stays visible.
+   The one other refusal it acts on is OpenCode's own free-tier eligibility gate
+   ("OpenCode's free tier can only be used from within OpenCode"), which makes the
+   free *route* temporarily unavailable: the same cooldown is armed with
+   `cooldownReason: "free-route"` and the same failover continues the turn on the
+   fallback. A generic `401`/`403`, an invalid key, or a configuration error never
+   fails over.
 4. **Fails over in the same session.** On a genuine free-model limit the plugin
    records an absolute cooldown, switches that session's model to the configured
    fallback, and lets OpenCode's own retry re-resolve the model. The retry
@@ -99,7 +105,7 @@ OpenCode v2 accepts npm-compatible package specifications, including Git URLs
 and exact tags. Install the published release:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.6
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.9
 opencode plugin list
 ```
 
@@ -183,12 +189,18 @@ and never delays it. See [`docs/coexistence.md`](docs/coexistence.md).
 ## How it decides
 
 ```
-FREE_HEALTHY  -- genuine free-model rate limit -->  FREE_COOLDOWN
-FREE_COOLDOWN -- cooldown reached               -->  FREE_PROBE
+FREE_HEALTHY  -- genuine free-model rate limit -->  FREE_COOLDOWN (reason: rate-limit)
+FREE_HEALTHY  -- free-tier gate refusal        -->  FREE_COOLDOWN (reason: free-route)
+FREE_COOLDOWN -- cooldown reached              -->  FREE_PROBE
 FREE_PROBE    -- success                       -->  FREE_HEALTHY
 FREE_PROBE    -- rate limited                  -->  FREE_COOLDOWN (level + 1)
 FREE_PROBE    -- inconclusive                  -->  FREE_HEALTHY (probe deferred)
 ```
+
+Both causes share one cooldown because both mean the free route cannot service a
+request right now; `cooldownReason` keeps the diagnosis honest, and a `free-route`
+cooldown is armed for `routeRejectRetryMs` without touching the ladder or any
+rate-limit bookkeeping.
 
 `FREE_PROBE` is derived, not stored: it is what `FREE_COOLDOWN` means once its
 absolute timestamp has passed and health is not yet confirmed. An inconclusive
@@ -238,6 +250,10 @@ cache reasons.
   bounded backoff ladder with jitter. Each failure on the ladder moves to the
   next (longer) delay, capped by `maxCooldownMs`; a confirmed recovery resets it.
   This is bounded probing, not a promise that recovery is instant.
+- **A free-route refusal has no reset at all.** OpenCode's free-tier eligibility
+  gate carries no provider reset, so the plugin uses `routeRejectRetryMs`
+  (default 5 minutes) as the bounded window and then tests the free route through
+  the ordinary recovery path. Managed sessions stay on the fallback until then.
 - **Scope.** A free tier is normally limited per provider account, so the
   cooldown is shared across sessions by default (`cooldownScope: "shared"`) and
   at most one probe is ever in flight. Set `"session"` if evidence shows your
@@ -267,7 +283,9 @@ opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action
 | Field | Meaning |
 | --- | --- |
 | `state` | `FREE_HEALTHY`, `FREE_COOLDOWN`, or `FREE_PROBE` |
-| `status` | one-line summary: `FREE (…)`, `FREE cooldown: 8m`, `probing FREE` |
+| `status` | one-line summary: `FREE (…)`, `FREE cooldown: 8m`, `FREE unavailable: route rejected (retry in 5m)`, `probing FREE` |
+| `cooldownReason` | `rate-limit` or `free-route` — why the current cooldown was armed |
+| `routeRejectedAt` | when the first free-route rejection of the episode was recognised |
 | `primary` / `fallback` | the effective routes |
 | `cooldownMs` / `cooldownEndsAt` | remaining and absolute cooldown |
 | `level` | position on the backoff ladder |

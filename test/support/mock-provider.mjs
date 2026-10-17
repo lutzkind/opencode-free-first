@@ -19,17 +19,26 @@ const port = Number(process.env.FF_MOCK_PORT ?? 8899);
 
 function defaults() {
   return {
-    mode: "ok", // ok | 429 | 500 | 401 | 400
+    mode: "ok", // ok | 429 | 500 | 401 | 400 | free-tier-gate
     /**
      * Serve the error `mode` for the first N requests of this role and succeed
      * afterwards. `null` (the default) keeps failing for the rest of the
-     * scenario. A finite value models a free tier that rate limits and then
-     * recovers, which is the state machine's whole reason to exist.
+     * scenario. A finite value models a free tier that rate limits — or that
+     * temporarily refuses the route — and then recovers, which is the state
+     * machine's whole reason to exist.
      */
     failFirst: null,
     body: undefined,
     retryAfterSeconds: undefined,
     delayMs: 0,
+    /**
+     * Apply the error `mode` (and count the request against `failFirst`) only
+     * for requests that carry tools, which is how the agent loop is identified.
+     * OpenCode's title request runs without tools and its failures are swallowed
+     * by OpenCode itself before any plugin retry hook, so a gate scenario that
+     * must reach the retry hook targets the agent loop explicitly.
+     */
+    onlyWithTools: false,
     /**
      * Prompt tokens reported on this role's responses. OpenCode treats the last
      * response's usage as the measured prompt size, so a large value is how a
@@ -46,6 +55,10 @@ function defaults() {
     gateProbe: false,
   };
 }
+
+/** OpenCode's own free-tier eligibility refusal, exactly as observed live. */
+const FREE_TIER_GATE_MESSAGE =
+  "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.";
 
 const served = { free: 0, paid: 0 };
 
@@ -212,9 +225,11 @@ const server = http.createServer(async (request, response) => {
   }
   const role = roleOf(raw);
   const config = state[role];
-  served[role] += 1;
+  const tooled = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+  const eligible = config.onlyWithTools !== true || tooled;
+  if (eligible) served[role] += 1;
   const limit = config.failFirst ?? Number.POSITIVE_INFINITY;
-  const failing = config.mode !== "ok" && served[role] <= limit;
+  const failing = config.mode !== "ok" && eligible && served[role] <= limit;
   const effective = failing ? config.mode : "ok";
   const model = String(parsed.model ?? "");
   const compaction = isCompaction(raw);
@@ -244,23 +259,33 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (effective !== "ok") {
-    const status = { 429: 429, 500: 500, 401: 401, 400: 400 }[effective] ?? 500;
-    const message =
-      config.body ??
-      (status === 429 ? "Rate limit exceeded. Please try again later." : `mock error ${status}`);
+    const status =
+      { 429: 429, 500: 500, 401: 401, 400: 400, "free-tier-gate": 403 }[effective] ?? 500;
+    const gated = effective === "free-tier-gate";
+    const message = gated
+      ? FREE_TIER_GATE_MESSAGE
+      : (config.body ??
+        (status === 429 ? "Rate limit exceeded. Please try again later." : `mock error ${status}`));
     const headers =
       config.retryAfterSeconds === undefined
         ? {}
         : { "retry-after": String(config.retryAfterSeconds) };
-    state.log.push({ event: "error-response", model, status, message, compaction });
+    state.log.push({
+      event: "error-response",
+      model,
+      status,
+      message,
+      compaction,
+      ...(gated ? { gate: true } : {}),
+    });
     sendJson(
       response,
       status,
       {
         error: {
           message,
-          type: status === 429 ? "rate_limit_error" : "mock_error",
-          code: status === 429 ? "rate_limit_exceeded" : "mock_error",
+          type: gated ? "free_tier_error" : status === 429 ? "rate_limit_error" : "mock_error",
+          code: gated ? "free_tier_error" : status === 429 ? "rate_limit_exceeded" : "mock_error",
         },
       },
       headers,

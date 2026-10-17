@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { classifyFreeLimit, extractReset, parseDelay, parseResetValue } from "../dist/classify.js";
+import {
+  classifyFreeLimit,
+  classifyFreeRouteRejection,
+  classifyProbeFailure,
+  extractReset,
+  parseDelay,
+  parseResetValue,
+} from "../dist/classify.js";
+
+const FREE_ROUTE_GATE =
+  "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.";
 
 describe("classifyFreeLimit", () => {
   it("recognises a bare HTTP 429", () => {
@@ -119,6 +129,50 @@ describe("classifyFreeLimit", () => {
       message: "rate limit exceeded",
     });
     assert.equal(verdict.limited, false);
+  });
+});
+
+describe("classifyFreeRouteRejection", () => {
+  it("recognises the exact free-tier eligibility gate", () => {
+    assert.deepEqual(classifyFreeRouteRejection({ message: FREE_ROUTE_GATE }), {
+      rejected: true,
+      reason: "free-tier-provenance-gate",
+    });
+    // The live incident delivered it as a 403 authentication-class refusal.
+    assert.equal(
+      classifyFreeRouteRejection({ type: "provider.auth", status: 403, message: FREE_ROUTE_GATE })
+        .rejected,
+      true,
+    );
+  });
+
+  it("stays narrow: a generic 403, 401, or auth failure never matches", () => {
+    for (const error of [
+      { type: "provider.auth", status: 403, message: "Forbidden" },
+      { type: "provider.auth", status: 401, message: "Invalid API key provided" },
+      { type: "provider.auth", status: 403, message: "permission denied" },
+      { type: "provider.invalid-request", status: 400, message: "malformed request" },
+      { type: "provider.quota", status: 402, message: "insufficient credits" },
+      { status: 429, message: "Rate limit exceeded. Please try again later." },
+    ]) {
+      assert.equal(classifyFreeRouteRejection(error).rejected, false, JSON.stringify(error));
+    }
+    assert.equal(classifyFreeRouteRejection(undefined).rejected, false);
+    assert.equal(classifyFreeRouteRejection({}).rejected, false);
+    assert.equal(classifyFreeRouteRejection({ message: "" }).rejected, false);
+  });
+
+  it("keeps the same text a probe-path refusal on the probe and a rejection on a real request", () => {
+    // The identical sentence means different things on the two paths: the
+    // transient generation probe is refused structurally (unsupported), while a
+    // real model request tells us the free route is temporarily unavailable.
+    assert.equal(
+      classifyProbeFailure({ tag: "Generate.UnavailableError", message: FREE_ROUTE_GATE }),
+      "unsupported",
+    );
+    assert.equal(classifyFreeRouteRejection({ message: FREE_ROUTE_GATE }).rejected, true);
+    // And the rate-limit classifier never sees it as exhaustion.
+    assert.equal(classifyFreeLimit({ message: FREE_ROUTE_GATE }).limited, false);
   });
 });
 

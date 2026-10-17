@@ -66,6 +66,7 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | `probePrompt` | `"Reply with the single word: pong"` | The probe's prompt. Keep it tiny. |
 | `probeMaxTokens` | `8` | Output bound applied to the probe through the `generate` hook. |
 | `probeUnsupportedBackoffMs` | `21600000` (6h) | How long to stop probing after the host refuses the probe path itself (OpenCode's free tier does, with `Generate.UnavailableError`). Recovery continues passively in the meantime. |
+| `routeRejectRetryMs` | `300000` (5m) | How long the free route stays off after OpenCode's own free-tier eligibility gate ("the free tier can only be used from within OpenCode") refused a real model request. The gate carries no provider reset, so this is the bounded window before the existing recovery path retries the free route through a real request. Between 1 000 and 86 400 000 ms. |
 | `continuationText` | OpenCode's own interrupted-continuation sentence | The invisible continuation admitted when a parked task is reclaimed. |
 
 ## Logging
@@ -74,7 +75,8 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | --- | --- | --- |
 | `logLevel` | `"info"` | `silent`, `error`, `info`, or `debug`. |
 
-`info` logs state transitions: free selected, rate limit detected, classification
+`info` logs state transitions: free selected, rate limit detected, free route
+rejected (with the classification, HTTP status, and retry window), classification
 reason, retry/reset source, cooldown start and expiry, fallback selected, probe
 scheduled/started/limited, free recovered, safe switch back to free, explicit
 manual override detected, stale fallback continuation neutralized, duplicate

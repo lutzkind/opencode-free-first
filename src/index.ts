@@ -1,6 +1,7 @@
 export type {
   Classification,
   FreeLimitKind,
+  FreeRouteRejection,
   ProbeOutcome,
   ProviderErrorView,
   ResetContext,
@@ -8,6 +9,7 @@ export type {
 } from "./classify.js";
 export {
   classifyFreeLimit,
+  classifyFreeRouteRejection,
   classifyProbeFailure,
   extractReset,
   parseDelay,
@@ -42,8 +44,9 @@ export type {
   StateStore,
 } from "./engine.js";
 export { FreeFirstEngine, toProviderErrorView } from "./engine.js";
-export type { HealthOptions, LimitedInput } from "./health.js";
+export type { FreeRouteUnavailableInput, HealthOptions, LimitedInput } from "./health.js";
 export {
+  applyFreeRouteUnavailable,
   applyLimited,
   backoffFor,
   clearElapsedCooldown,
@@ -65,6 +68,7 @@ export { createLogger, scrub } from "./log.js";
 export type { FreeFirstRpcInput, FreeFirstRpcOutput } from "./rpc.js";
 export { FREE_FIRST_RPC, FREE_FIRST_RPC_ID, FREE_FIRST_USAGE, freeFirstEventType } from "./rpc.js";
 export type {
+  CooldownReason,
   FreeState,
   HealthRecord,
   ModelRef,

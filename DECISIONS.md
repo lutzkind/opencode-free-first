@@ -234,6 +234,61 @@ on the fallback with zero free requests and no failed compaction, and a genuine
 limit discovered by a compaction fails over and succeeds exactly once on the
 fallback.
 
+## 025 — The free-tier gate shares the cooldown, with a distinct reason
+
+OpenCode's own free-tier eligibility gate ("OpenCode's free tier can only be used
+from within OpenCode") answers a real model request as a `provider.auth` failure
+with HTTP 403, so before this change it was left to surface and every affected
+session died. It is not a rate limit (no 429, no quota signal, no provider reset)
+and it is not a credential problem (the same refusal reaches ordinary OpenCode
+users on a healthy account; it was a transient upstream condition on 2026-10-17).
+
+The refusal therefore arms the *existing* shared cooldown with
+`cooldownReason: "free-route"` instead of introducing a second blocking state.
+The consequence is identical — the free route cannot service a request — so
+recovery, cross-instance adoption, the cooldown-routing guard, and diagnostics all
+reuse one mechanism, and nothing new can drift out of sync with it. What must stay
+separate is the *cause*: a `free-route` cooldown is armed for `routeRejectRetryMs`
+(a bounded window, since no provider reset exists), records `routeRejectedAt`,
+never advances the ladder, and touches none of the rate-limit bookkeeping, so
+diagnostics can never present it as a 429 and `statusLine` names the route rather
+than a cooldown.
+
+Detection stays exact: only the gate's own sentence on a real model request
+matches. A generic 401/403, an invalid key, an unsupported provider, or a
+malformed request keeps its real type and never fails over — a false positive
+would silently hide an operator problem behind a model switch, which is the same
+reasoning as decision 005.
+
+Evidence: the live incident (several concurrent sessions, each failing with the
+gate, no failover), unit coverage for the classification boundary, the shared
+episode, failover, recovery and restart, and integration cases that run the real
+CLI: the gate fails the same turn over to the fallback exactly once with no
+duplicated prompt, and the existing recovery path returns the session to the free
+model once the gate clears.
+
+## 026 — A refused probe path stays a bounded, passive-only problem
+
+Decision 019 already handles the gate when it arrives on the out-of-band probe:
+the probe path is structurally refused, so it is `unsupported`, backed off for
+`probeUnsupportedBackoffMs` (6h), and recovery continues passively. That is
+retained unchanged: a persisted probe-capability verdict keyed to an OpenCode
+version and model would add a second compatibility framework for a request that
+runs at most once per back-off window, fails open, and disturbs nothing. The
+distinction that matters instead is path-dependent and is asserted in tests: the
+same sentence is a *probe-path refusal* on `ctx.generate.text` and a
+*free-route rejection* on a real model request.
+
+## 027 — Passive recovery drops the elapsed cooldown too
+
+Decision 020 said an elapsed cooldown must leave the record so `status` stops
+reporting `FREE_PROBE` and the scheduler stops waking for a boundary already
+behind it. The passive branch (probing disabled) had never applied it, so with
+`"probe": false` the record kept an elapsed timestamp and the scheduler re-armed
+a due wake-up in a tight loop. Writing the free-route tests surfaced it; the
+passive branch now normalises the record before returning the waiting sessions to
+the free model, which is what the probe branch already did.
+
 ## 017 — No paid traffic to keep a cache warm
 
 There is no evidence that warming the paid fallback's prompt cache pays for the
