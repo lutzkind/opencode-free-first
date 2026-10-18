@@ -6,20 +6,25 @@
 FREE_HEALTHY
     │  genuine free-model rate limit          cooldownReason: "rate-limit"
     │  OpenCode free-tier eligibility gate    cooldownReason: "free-route"
+    │  transient provider outage              cooldownReason: "transient-availability"
     ▼
 FREE_COOLDOWN  ── cooldownUntil is an absolute epoch-millisecond timestamp
     │  cooldownUntil <= now
     ▼
 FREE_PROBE
-    ├─ success       ──▶ FREE_HEALTHY                       (recovery confirmed)
-    ├─ rate limited  ──▶ FREE_COOLDOWN  (level + 1)          (a real limit)
-    └─ inconclusive  ──▶ FREE_HEALTHY   (unconfirmed)        (unknown, never limited)
+    ├─ success            ──▶ FREE_HEALTHY                       (recovery confirmed)
+    ├─ rate limited       ──▶ FREE_COOLDOWN  (level + 1)          (a real limit)
+    ├─ still unavailable  ──▶ FREE_COOLDOWN  (transient + 1)      (a real outage)
+    └─ inconclusive       ──▶ FREE_HEALTHY   (unconfirmed)        (unknown, never limited)
 
-Both causes arm the *same* cooldown because both mean the same thing: the free
-route cannot service a request right now. The reason keeps them apart. A
+All three causes arm the *same* cooldown because all three mean the same thing:
+the free route cannot service a request right now. The reason keeps them apart. A
 `free-route` cooldown is armed for `routeRejectRetryMs` (no provider reset
-exists), does not touch the ladder or the rate-limit bookkeeping, and is
-reported as a route rejection rather than as a rate limit.
+exists), does not touch any ladder or the rate-limit bookkeeping, and is reported
+as a route rejection rather than as a rate limit. A `transient-availability`
+cooldown walks its own bounded ladder (first rung by default, escalating per
+recurring outage) and touches neither the rate-limit ladder nor the gate's
+bookkeeping, so a provider 500 is never presented as a quota event.
 
 An inconclusive result re-arms the *probe* on a bounded back-off
 (`probeBackoffUntil`) and returns the waiting sessions to the free model, so the
@@ -43,32 +48,38 @@ mid-transition.
 | Request preparation, fallback model, cooldown elapsed | Delegate to the single recovery path. |
 | Retry hook, free model, genuine limit | Record the cooldown (`rate-limit`), switch to the fallback, force one cheap retry. |
 | Retry hook, free model, exact free-tier gate | Record the cooldown (`free-route`), switch the same session to the fallback, force one cheap retry. A generic 401/403 or any other auth/config failure is left alone. |
+| Retry hook, free model, transient outage (5xx, structured provider-internal/timeout, qualifying transport) | Record the cooldown (`transient-availability`) on its own ladder, switch the same session to the fallback, force one cheap retry. A `400`, a `401`, an invalid model, a content filter, a context-length error, a tool failure, or a plugin bug is left alone. |
 | Prompt admission or prepare, free model, `free-route` cooldown | Same routing as a rate-limit cooldown: no request is spent on a temporarily refused route. |
 | Response observed, free model, non-error status | Confirmed recovery: clear the cooldown and reset the ladder. |
 | Recovery tick | Probe, then reclaim parked work, then return waiting sessions to the free model. A probe that cannot decide counts as a fail-open outcome, not as a block. |
 
 ## Probe outcomes
 
-Every probe attempt classifies its result three ways:
+Every probe attempt classifies its result four ways:
 
 | Outcome | Meaning | Effect |
 | --- | --- | --- |
 | `limited` | A real rate limit (`429`, structured `provider.rate-limit`/`provider.quota`, or exhaustion wording) | Arm (or extend) a real, blocking cooldown |
+| `transient` | A real, current outage of the route: provider/server 5xx, structured `provider.internal`/`provider.timeout`, a qualifying transport failure | Re-arm the transient cooldown on the next ladder rung; the waiting sessions stay on the fallback |
 | `unsupported` | The host refuses the probe path itself — OpenCode's free tier answers `Generate.UnavailableError` because transient generation is not the agent loop — or the model route is structurally refused (`invalid-request`, `no-route`, `auth`, `unsupported-operation`) | Fail open, log at `error`, and stop probing for `probeUnsupportedBackoffMs` (default 6h) |
-| `inconclusive` | Anything else: a transport error, a 5xx, anything unexplained | Fail open, escalate the probe back-off along the normal ladder (capped by `maxCooldownMs`), and let real traffic decide |
+| `inconclusive` | Anything else: an unclassified failure, an unexplained error | Fail open, escalate the probe back-off along the normal ladder (capped by `maxCooldownMs`), and let real traffic decide |
 
-None of the last two ever sets `cooldownUntil`, so none of them can keep the free
-model out of use. A later genuine limit still establishes a new blocking cooldown,
-and it keeps the probe verdict: a new limit says nothing new about whether the
-probe path works.
+The last two never set `cooldownUntil`, so they can never keep the free model out
+of use: only a real limit or a positively identified outage blocks, and both
+block for a bounded window. A later genuine limit still establishes a new blocking
+cooldown, and it keeps the probe verdict: a new limit says nothing new about
+whether the probe path works.
 
 ## Elapsed cooldowns
 
-A cooldown whose timestamp has passed is removed from the record on every fail-open
-outcome — including the passive recovery branch (probing disabled), which
-otherwise kept reporting `FREE_PROBE` and re-armed a due wake-up in a tight loop.
-An elapsed cooldown is normalised away while the ladder position, the probe
-bookkeeping, and the last rejection time survive.
+A cooldown whose timestamp has passed is removed from the record on every
+fail-open outcome — including the passive recovery branch (probing disabled) and
+the branch where no session is waiting on the fallback (an opted-out session, a
+limit with no reachable fallback), which would otherwise keep reporting
+`FREE_PROBE` and re-arm a due wake-up in a tight loop. An elapsed cooldown is
+normalised away while the ladder positions, the probe bookkeeping, the transient
+counter, and the last limit/rejection/outage times survive. Dropping the record
+is not a claimed recovery: `lastHealthyAt` is only set by a confirmed success.
 
 ## Reset metadata
 
@@ -107,13 +118,18 @@ Used only when no reset metadata exists:
 
 - The **level advances on each genuine limit** and resets to zero on confirmed
   recovery. A `free-route` cooldown never advances it: it is not a rate limit.
+- A **transient outage walks a separate counter** (`transientFailures`) over the
+  same configured ladder: the first rung for an isolated outage, the next rung
+  each time it recurs, clamped at the last entry. It never advances (or reads)
+  the rate-limit `level`, and a rate limit never advances the transient counter.
+  A confirmed success resets both.
 - `maxCooldownMs` caps a ladder-derived cooldown.
 - `jitterRatio` adds symmetric jitter, clamped so jitter can neither shorten a
   cooldown below the minimum nor extend it past the cap. Symmetric jitter keeps
   the expected delay on the ladder value while spreading probes across sessions.
-- Repeated duplicate signals for one provider window do not advance the level
-  (`duplicateLimitWindowMs`), but a later authoritative reset still extends the
-  cooldown.
+- Repeated duplicate signals for one provider window (or one outage —
+  `duplicateLimitWindowMs` covers both) do not advance the relevant counter, but
+  a later authoritative reset still extends a rate-limit cooldown.
 
 ## Concurrency
 
@@ -167,5 +183,6 @@ a restart cannot move a session the user repointed while OpenCode was stopped.
 | Healthy | `FREE_HEALTHY` | `FREE (provider/model)` |
 | Rate-limited | `FREE_COOLDOWN` (`cooldownReason: "rate-limit"`) | `FREE cooldown: 8m` |
 | Free route temporarily unavailable | `FREE_COOLDOWN` (`cooldownReason: "free-route"`, `routeRejectedAt` set) | `FREE unavailable: route rejected (retry in 8m)` |
+| Transient provider outage | `FREE_COOLDOWN` (`cooldownReason: "transient-availability"`, `transientFailures`/`lastTransientType` set) | `FREE unavailable: transient provider failure (retry in 8m)` |
 | Cooldown elapsed, unconfirmed | `FREE_PROBE` | `probing FREE` |
 | Disabled | — | `disabled` |

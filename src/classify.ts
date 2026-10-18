@@ -1,17 +1,25 @@
 /**
  * Rate-limit classification and reset-metadata extraction.
  *
- * Classification is deliberately conservative. Free-tier rate limits are the
- * only thing this plugin reacts to, so an error must be *positively*
- * identified. Everything else keeps its real failure type and stays visible:
- * auth failures, invalid requests, content filters, tool failures, transport
- * errors, provider 5xx, and plugin bugs are never re-labelled as exhaustion.
+ * Classification is deliberately conservative. A free-model failure is acted
+ * on only after *positive* identification, and each cause keeps its own
+ * category so diagnostics never conflate them:
  *
- * OpenCode 2.0.27 classifies provider failures into structured types before a
+ *   - `classifyFreeLimit` — exhaustion (429, structured rate-limit/quota,
+ *     tightly scoped exhaustion wording). Everything else keeps its real
+ *     failure type and stays visible.
+ *   - `classifyFreeRouteRejection` — OpenCode's own free-tier eligibility gate
+ *     on a real model request.
+ *   - `classifyTransientAvailability` — the free route is *temporarily unable*
+ *     to service an otherwise valid request: provider/server 5xx, OpenCode's
+ *     structured `provider.internal`, structured provider timeouts, and the
+ *     transport/connectivity failures OpenCode itself treats as transient.
+ *
+ * OpenCode 2.0.27+ classifies provider failures into structured types before a
  * retry hook runs (`provider.rate-limit`, `provider.quota`, `provider.auth`,
- * `provider.invalid-request`, `provider.internal`, …) and passes the HTTP
- * status plus the raw response body on the same object. Detection therefore
- * follows this priority order:
+ * `provider.internal`, `provider.transport`, `provider.timeout`, …) and passes
+ * the HTTP status plus the raw response body on the same object. Detection
+ * therefore follows this priority order:
  *
  *   1. HTTP status `429`
  *   2. structured rate-limit type
@@ -146,13 +154,17 @@ export function classifyFreeLimit(error: ProviderErrorView | undefined): Classif
  * Outcome of an out-of-band recovery probe.
  *
  * - `limited` — the free model really is rate limited; block and back off.
+ * - `transient` — the free route is temporarily unable to serve the request
+ *   (provider 5xx, structured provider-internal, qualifying transport/timeout).
+ *   The mechanism is working; the route is not. Block for the bounded
+ *   transient backoff and let the existing recovery path try again.
  * - `unsupported` — the probe mechanism itself is refused for this model (for
  *   example OpenCode's free tier permits use only from its own agent loop).
  *   Retrying the probe every minute is pointless, so it backs off hard.
  * - `inconclusive` — anything else. Unknown, never *limited*: fail open and let
  *   the next real request decide.
  */
-export type ProbeOutcome = "healthy" | "limited" | "unsupported" | "inconclusive";
+export type ProbeOutcome = "healthy" | "limited" | "transient" | "unsupported" | "inconclusive";
 
 const UNSUPPORTED_TYPES = new Set([
   "provider.invalid-request",
@@ -178,6 +190,10 @@ export function classifyProbeFailure(error: ProviderErrorView | undefined): Prob
     return "unsupported";
   }
   if (error.type !== undefined && UNSUPPORTED_TYPES.has(error.type)) return "unsupported";
+  // The route is temporarily unable to serve the probe: not a verdict about the
+  // probe mechanism, and not an unknown. Block for the bounded transient
+  // backoff so waiting sessions stay on the fallback without thrashing.
+  if (classifyTransientAvailability(error).transient) return "transient";
   return "inconclusive";
 }
 
@@ -224,6 +240,153 @@ export function classifyFreeRouteRejection(
     return { rejected: true, reason: "free-tier-provenance-gate" };
   }
   return { rejected: false, reason: "no-free-route-gate" };
+}
+
+/**
+ * Transient free-route availability.
+ *
+ * The stable category for "the free route cannot currently serve an otherwise
+ * valid request": provider/server 5xx, OpenCode's structured
+ * `provider.internal` (which OpenCode 2.0.30 constructs for every HTTP status
+ * >= 500, for `409`, and for provider-reported network-error finishes), the
+ * structured provider timeout, and the transport/connectivity failures that
+ * OpenCode itself treats as transient.
+ *
+ * This is deliberately separate from exhaustion: a provider 500 is not a quota
+ * event, carries no reset metadata, and must never be presented as a rate
+ * limit. It is also deliberately separate from request/account/configuration
+ * defects: a `400`, an ordinary `401`/`403`, an invalid model, a content
+ * filter, a context-length error, a tool failure, or a plugin bug stays
+ * visible and never fails over.
+ *
+ * The transport predicate mirrors OpenCode 2.0.30's own transient-connectivity
+ * test (its `shouldRetry`/`nn` walk: codes `ECONNRESET`, `ECONNREFUSED`,
+ * `ETIMEDOUT`, `EPIPE`, `ConnectionRefused`, `ConnectionClosed`,
+ * `FailedToOpenSocket`, any `UND_ERR_*`), because the plugin observes the
+ * message, not the code. A transport failure is only classified when OpenCode
+ * already labelled it `provider.transport`, so an unqualified message can
+ * never reach the failover.
+ */
+export type TransientCategory = "server" | "timeout" | "transport";
+
+export interface TransientClassification {
+  readonly transient: boolean;
+  readonly category?: TransientCategory;
+  /** Stable, loggable explanation of why the verdict was reached. */
+  readonly reason: string;
+}
+
+/** HTTP statuses that mean "the server could not serve this request now". */
+const TRANSIENT_HTTP_STATUSES: ReadonlySet<number> = new Set([500, 502, 503, 504]);
+
+/**
+ * Structured OpenCode error types that explicitly deny a transient reading.
+ * When one of these is present it wins over every weaker signal, so a real
+ * fault is never hidden behind paid routing.
+ */
+const NON_TRANSIENT_TYPES = new Set([
+  "provider.auth",
+  "provider.invalid-request",
+  "provider.invalid-output",
+  "provider.content-filter",
+  "provider.unsupported-operation",
+  "provider.no-route",
+  "provider.rate-limit",
+  "provider.quota",
+  "permission.rejected",
+  "tool.execution",
+  "unknown",
+]);
+
+/**
+ * Transient connectivity codes, mirroring OpenCode's own transient test.
+ * `UND_ERR_*` covers undici's socket/page errors.
+ */
+const TRANSIENT_TRANSPORT_CODE =
+  /\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ConnectionRefused|ConnectionClosed|FailedToOpenSocket|UND_ERR_[A-Z0-9_]+)\b/i;
+
+/** Message phrases OpenCode treats as transient when a code is not preserved. */
+const TRANSIENT_TRANSPORT_PHRASES: ReadonlyArray<{
+  readonly slug: string;
+  readonly phrase: string;
+}> = [
+  { slug: "fetch-failed", phrase: "fetch failed" },
+  { slug: "failed-to-fetch", phrase: "failed to fetch" },
+  { slug: "other-side-closed", phrase: "other side closed" },
+  { slug: "socket-hang-up", phrase: "socket hang up" },
+  { slug: "sse-read-timed-out", phrase: "sse read timed out" },
+  { slug: "headers-timed-out", phrase: "response headers timed out" },
+];
+
+/**
+ * A message that is only ever emitted for a dropped connection. Matched as the
+ * whole message (trimmed, case-insensitive) because the word alone is too
+ * broad to qualify.
+ */
+const TRANSIENT_TRANSPORT_EXACT = new Set(["terminated"]);
+
+/**
+ * A transport/timeout wording that qualifies even without a code: the
+ * structured type already says the failure happened at the transport layer.
+ */
+const TRANSIENT_TIMEOUT_PHRASE = /\btimed out\b|\btimeout\b/i;
+
+function matchTransientTransport(message: string): string | undefined {
+  const trimmed = message.trim();
+  if (trimmed.length === 0) return undefined;
+  const lowered = trimmed.toLowerCase();
+  const code = TRANSIENT_TRANSPORT_CODE.exec(trimmed);
+  if (code?.[1] !== undefined) return code[1].toLowerCase();
+  for (const entry of TRANSIENT_TRANSPORT_PHRASES) {
+    if (lowered.includes(entry.phrase)) return entry.slug;
+  }
+  if (TRANSIENT_TRANSPORT_EXACT.has(lowered)) return "terminated";
+  if (TRANSIENT_TIMEOUT_PHRASE.test(trimmed)) return "timeout";
+  return undefined;
+}
+
+export function classifyTransientAvailability(
+  error: ProviderErrorView | undefined,
+): TransientClassification {
+  if (!error) return { transient: false, reason: "no-error" };
+
+  const type = typeof error.type === "string" ? error.type : undefined;
+  const message = typeof error.message === "string" ? error.message : "";
+  const status = typeof error.status === "number" ? error.status : undefined;
+
+  if (type !== undefined && NON_TRANSIENT_TYPES.has(type)) {
+    return { transient: false, reason: `structured-${type}` };
+  }
+  if (type === "provider.timeout") {
+    return { transient: true, category: "timeout", reason: "structured-timeout" };
+  }
+  // The concrete HTTP status is the most precise evidence, so it names the
+  // classification when the provider supplied one.
+  if (status !== undefined && TRANSIENT_HTTP_STATUSES.has(status)) {
+    return { transient: true, category: "server", reason: `http-${status}` };
+  }
+  // OpenCode only constructs `provider.internal` for a server-side or
+  // network-error path (HTTP >= 500, 409, or a network-error finish), so the
+  // structured type alone is positive evidence.
+  if (type === "provider.internal") {
+    return { transient: true, category: "server", reason: "structured-provider-internal" };
+  }
+  // A definite client-side status is a request/account problem no matter what
+  // the message looks like.
+  if (status !== undefined && status >= 400 && status < 500) {
+    return { transient: false, reason: `http-${status}` };
+  }
+  if (type === "provider.transport") {
+    const match = matchTransientTransport(message);
+    if (match !== undefined) {
+      return { transient: true, category: "transport", reason: `transport-${match}` };
+    }
+    return { transient: false, reason: "transport-unqualified" };
+  }
+  return {
+    transient: false,
+    reason: type === undefined ? "no-signal" : `unclassified-${type}`,
+  };
 }
 
 export interface ResetHint {

@@ -80,7 +80,7 @@ describe("failover", () => {
     });
     assert.deepEqual(decision, { retry: false });
     assert.equal(sessions.of("switchModel").length, 0);
-    assert.ok(log.has("provider failure is not a free-model rate limit"));
+    assert.ok(log.has("provider failure is not a free-model availability failure"));
   });
 
   it("does not fail over on a 401", async () => {
@@ -92,13 +92,24 @@ describe("failover", () => {
     assert.equal(sessions.of("switchModel").length, 0);
   });
 
-  it("does not fail over on a generic 500", async () => {
-    const { engine, sessions } = await boot();
+  it("fails a provider 500 over as a transient availability failure, not a rate limit", async () => {
+    // Superseded policy: a provider 5xx used to be left to surface. It is a
+    // transient availability failure of the free route, so the same turn now
+    // continues on the fallback — but it must never be presented as, or
+    // recorded as, a rate limit.
+    const { engine, sessions, log } = await boot();
     engine.onModelRequest("ses_a", FREE, "primary");
-    await retry(engine, {
+    const decision = await retry(engine, {
       error: { type: "provider.internal", status: 500, message: "internal server error" },
     });
-    assert.equal(sessions.of("switchModel").length, 0);
+    assert.deepEqual(decision, { retry: true, delay: 100 });
+    assert.deepEqual(
+      sessions.of("switchModel").map((call) => `${call.sessionID}:${call.model.id}`),
+      ["ses_a:fake-paid"],
+    );
+    assert.equal(engine.status().cooldownReason, "transient-availability");
+    assert.equal(engine.status().lastRateLimitAt, undefined, "a 500 is never a 429");
+    assert.equal(log.has("free rate limit detected"), false);
   });
 
   it("does not fail over on a tool failure or a plugin bug", async () => {

@@ -289,6 +289,92 @@ a due wake-up in a tight loop. Writing the free-route tests surfaced it; the
 passive branch now normalises the record before returning the waiting sessions to
 the free model, which is what the probe branch already did.
 
+## 028 — Transient free-route availability failures fail over (supersedes the rate-limit-only policy)
+
+Until now the failover covered exactly two causes: a genuine rate limit and
+OpenCode's free-tier eligibility gate. Everything else was left to surface — so a
+provider 500 on the free route killed the turn even when the configured fallback
+was available. The live incident (2026-10-18): `AI.Error.ProviderInternal`
+("Provider request failed with HTTP 500") failed a session's drain while the
+paid route was healthy. That policy is **superseded**.
+
+The invariant now is:
+
+> If the configured free route is temporarily unable to serve an otherwise valid
+> request, continue the same turn on the configured fallback. If the request,
+> credentials, configuration, or plugin itself is broken, surface the real error
+> instead of hiding it behind fallback.
+
+The repair keeps the shape of the gate work (decisions 025–027) exactly: one new
+classifier category (`transient-availability`), one new health transition that
+reuses the shared cooldown, one new reason on `cooldownReason`, and the existing
+failover, cooldown-routing, recovery, retry-kind, and persistence paths, with no
+new mechanism of any kind. The category covers provider/server `500`/`502`/`503`/
+`504`, OpenCode's structured `provider.internal` (which OpenCode 2.0.30 only
+constructs for server-side or network-error paths), structured `provider.timeout`,
+and the transport/connectivity failures OpenCode's own retry policy already
+treats as transient (`ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `EPIPE`,
+`ConnectionRefused`, `ConnectionClosed`, `FailedToOpenSocket`, any `UND_ERR_*`,
+`fetch failed`, `terminated`, `other side closed`, `socket hang up`, a timeout
+wording) — the plugin sees the message, not the code, so the predicate is
+mirrored from OpenCode's own transient test rather than invented.
+
+Being a *separate* category, not a broadened rate limit, is the point: a 500 is
+not a quota event and must never be recorded as one. It walks its own bounded
+ladder (`transientFailures` against the configured `backoffMs`), so a single
+isolated outage blocks the free route for one short rung — never hours — and
+repeated outages back off further, bounded by `maxCooldownMs`. A confirmed
+success resets the ladder. A rate limit still wins its own bookkeeping: the
+`level` ladder, the reset source, and `lastRateLimit*` are never touched by an
+outage, and vice versa.
+
+The conservative half is unchanged in direction and only refined in scope: a
+`400`, a `401`, a generic `403`, an invalid key, an invalid model, a content
+filter, a context-length error, a tool failure, a plugin bug, or an unclassified
+failure without positive evidence keeps its real type and never fails over. A
+false positive would silently hide an operator problem behind paid routing, which
+is the same reasoning as decision 005.
+
+Evidence: the live `ProviderInternal` 500 shape is covered by unit tests for the
+classifier and the engine (failover, session retention, compaction suppression,
+no-fallback, opt-out, duplicates, bounded escalation, recovery, probe re-arm,
+restart, adoption), and by two live-CLI integration cases that run the real
+OpenCode CLI against the deterministic mock provider: a 500 fails the same turn
+over with no duplicated prompt and the continuation carrying the same
+conversation and tool set, and the existing recovery path returns the session to
+the free model automatically once the outage clears.
+
+## 029 — The reason label names the cause that owns the current deadline
+
+Three causes share the one cooldown (decision 025's reasoning, extended by 028).
+What must stay apart is the diagnosis. Two rules make the shared record honest in
+both directions:
+
+- a live cooldown is never shortened by a later signal — the later deadline wins;
+- `cooldownReason` names the cause that owns the deadline, not merely the most
+  recent signal.
+
+So a transient outage that arrives while a live rate-limit or free-route cooldown
+still has the longer deadline is *recorded* (its ladder and timestamps move, so
+escalation continues) but does not relabel the cooldown or hide the rate limit's
+metadata; and a transient cooldown keeps its own label until it is superseded by a
+cause with a longer deadline. Diagnostics can therefore always answer "why is the
+free route out right now" without conflating a provider 500 with a quota event —
+which is exactly the standard decision 025 set for the gate.
+
+## 030 — An elapsed cooldown with no waiting session is dropped
+
+Decision 020/027 required an elapsed cooldown to leave the record, but the
+no-waiting-session path (an opted-out session observes a limit, a limit with no
+reachable fallback) still kept it: recovery returned early, nothing normalised the
+record, and the scheduler re-armed a 1 ms wake-up for a boundary already behind it
+— a measurable busy loop (1000 wake-ups per second) for as long as the record
+stayed elapsed. The same gap existed when both probing and passive recovery were
+disabled. Recovery now normalises the elapsed record on every branch before it
+decides anything else, while keeping the ladder positions and the outage/limit
+history. Dropping the record here is explicitly *not* a claimed recovery:
+`lastHealthyAt` is not set.
+
 ## 017 — No paid traffic to keep a cache warm
 
 There is no evidence that warming the paid fallback's prompt cache pays for the

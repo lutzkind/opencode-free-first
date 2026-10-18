@@ -668,7 +668,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     assert.match(result.stdout, /free route rejected/);
     assert.match(result.stdout, /fallback selected/);
     assert.match(result.stdout, /model transition/);
-    assert.doesNotMatch(result.stdout, /provider failure is not a free-model rate limit/);
+    assert.doesNotMatch(result.stdout, /provider failure is not a free-model availability failure/);
     assert.match(result.stdout, /MOCK_OK model=ff-paid/, "the task finished on the fallback");
 
     const state = await mockState();
@@ -841,6 +841,176 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       state.log.filter((entry) => entry.event === "request" && entry.role === "paid").length,
       0,
       "no paid request was made for an authentication failure",
+    );
+  });
+
+  it("Case 15 — a provider 500 fails the same turn over instead of killing it", async () => {
+    // The live incident (2026-10-18): the free route answered a real model
+    // request with `Provider request failed with HTTP 500` and the turn died,
+    // even though the configured fallback was available. The superseded policy
+    // only failed over on a rate limit or the free-tier gate.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "500", failFirst: 1, onlyWithTools: true },
+      paid: { mode: "ok" },
+    });
+    const result = await run("Reply with the word READY");
+    assertOk(result);
+
+    assert.match(result.stdout, /free route transient failure detected/);
+    assert.match(result.stdout, /fallback selected/);
+    assert.match(result.stdout, /availability-failover/);
+    assert.doesNotMatch(result.stdout, /free rate limit detected/, "a 500 is not a 429");
+    assert.match(result.stdout, /MOCK_OK model=ff-paid/, "the task finished on the fallback");
+
+    const state = await mockState();
+    const errors = state.log.filter((entry) => entry.event === "error-response");
+    assert.equal(errors.length, 1, "the provider outage was served exactly once");
+    assert.equal(errors[0].status, 500);
+    const requests = state.log.filter((entry) => entry.event === "request");
+    const free = requests.filter((entry) => entry.role === "free");
+    const paid = requests.filter((entry) => entry.role === "paid");
+    assert.ok(paid.length >= 1, "the failed turn continued on the fallback");
+    // The continuation is the *same* failed request, not a re-sent prompt: the
+    // message count, the tool set, and the conversation are identical.
+    const failed = free.at(-1);
+    assert.equal(
+      paid[0].messages,
+      failed.messages,
+      "the continuation carried the same conversation",
+    );
+    assert.equal(paid[0].tools, failed.tools, "the continuation kept the same tool set");
+
+    const record = transcript();
+    assert.equal(record.sessions.length, 1, "the same session finished the turn");
+    assert.equal(
+      record.messages.filter((message) => message.type === "user").length,
+      1,
+      "the prompt was never duplicated",
+    );
+    assert.equal(record.model?.id, "ff-paid");
+  });
+
+  it("Case 16 — the free route returns automatically after a provider outage", async () => {
+    // The other half of the contract: the bounded transient cooldown must be
+    // waitable, and the existing recovery path must return the same session to
+    // the free model once the provider is healthy again.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "500", failFirst: 1, onlyWithTools: true },
+      paid: { mode: "ok" },
+    });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        title: "provider-outage",
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      assert.ok(sessionID, `no session id: ${JSON.stringify(created)}`);
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with the word READY",
+      });
+
+      const context = async () =>
+        (await call("GET", `/api/session/${sessionID}/context`))?.data ?? [];
+      const answers = (messages) =>
+        messages.filter(
+          (message) =>
+            message.type === "assistant" &&
+            (message.content ?? []).some(
+              (part) => part.type === "text" && String(part.text ?? "").includes("MOCK_OK"),
+            ),
+        );
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (answers(await context()).length >= 1) break;
+      }
+
+      const rpc = async () =>
+        (
+          await call("POST", "/api/rpc/opencode-free-first/control", {
+            input: { action: "status" },
+          })
+        )?.output?.status ?? {};
+
+      const during = await rpc();
+      const first = answers(await context());
+      assert.equal(first.length, 1, "the first turn was answered exactly once");
+      assert.match(
+        first[0].content.map((part) => part.text ?? "").join(""),
+        /MOCK_OK model=ff-paid/,
+      );
+
+      // Wait for the bounded transient window and the existing recovery path.
+      let after;
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        after = await rpc();
+        if (after.state === "FREE_HEALTHY" && after.fallbackSessions === 0) break;
+      }
+
+      // The recovered route must actually serve the next turn.
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with the word READY",
+      });
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (answers(await context()).length >= 2) break;
+      }
+      const session = (await call("GET", `/api/session/${sessionID}`))?.data;
+      return { during, after, messages: await context(), session };
+    });
+
+    assert.equal(outcome.during.state, "FREE_COOLDOWN");
+    assert.equal(
+      outcome.during.cooldownReason,
+      "transient-availability",
+      "the status names the transient cause",
+    );
+    assert.equal(outcome.during.lastRateLimitAt, undefined, "no rate-limit metadata was invented");
+    assert.equal(outcome.during.transientFailures, 1);
+    assert.equal(outcome.during.lastTransientType, "failover-http-500");
+    assert.match(outcome.during.status, /transient provider failure/);
+    assert.equal(outcome.after.state, "FREE_HEALTHY", "recovery returned the route to FREE");
+    assert.equal(outcome.after.cooldownReason, undefined);
+    assert.equal(outcome.after.fallbackSessions, 0);
+    assert.equal(outcome.after.transientFailures, 0, "the confirmed success reset the ladder");
+    assert.equal(outcome.session?.model?.id, "ff-free", "the session is back on the free model");
+
+    const answers = outcome.messages.filter(
+      (message) =>
+        message.type === "assistant" &&
+        (message.content ?? []).some(
+          (part) => part.type === "text" && String(part.text ?? "").includes("MOCK_OK"),
+        ),
+    );
+    assert.equal(answers.length, 2, "each turn was answered exactly once");
+    assert.match(
+      answers[1].content.map((part) => part.text ?? "").join(""),
+      /MOCK_OK model=ff-free/,
+      "the second turn ran on the recovered free route",
+    );
+    assert.equal(
+      outcome.messages.filter((message) => message.type === "user").length,
+      2,
+      "no continuation input was injected",
+    );
+
+    const state = await mockState();
+    assert.equal(
+      state.log.filter((entry) => entry.event === "error-response").length,
+      1,
+      "only the first free request hit the outage",
+    );
+    assert.ok(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "free").length >= 3,
+      "the free route was used again after the outage",
     );
   });
 

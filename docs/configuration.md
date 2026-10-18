@@ -47,7 +47,7 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | `adoptFallbackSessions` | `false` | Also manage sessions whose model is the configured `fallback`, returning them to the free model when it is usable. Leave off unless you want free-first to move sessions you left on a paid route. |
 | `respectExplicitModelSelection` | `true` | Stop managing a session when you pick another model by hand. With `false`, a manual switch to the paid route keeps the session managed. |
 | `passiveRecovery` | `true` | Let the next real model call confirm recovery when probing is not used. |
-| `probe` | `true` | Issue one tiny out-of-band recovery probe at cooldown expiry. Alias: `recoveryProbe`. A probe that cannot decide never blocks the free model; only a real rate limit does. |
+| `probe` | `true` | Issue one tiny out-of-band recovery probe at cooldown expiry. Alias: `recoveryProbe`. A probe that cannot decide never blocks the free model; only a real rate limit or a positively identified transient outage does. |
 | `parkPreemption` | `true` | Reclaim a fallback request parked by another plugin's pre-model hold once the free model is confirmed healthy. |
 | `cooldownScope` | `"shared"` | `"shared"` keeps one cooldown for the whole OpenCode instance (a free tier is normally per account, and this also prevents probe storms). `"session"` limits per session. |
 | `sessionLimit` | `200` | Upper bound on remembered sessions; the least recently updated are evicted. |
@@ -56,11 +56,11 @@ so a switch does not silently reset the user's reasoning-effort setting.
 
 | Option | Default | Notes |
 | --- | --- | --- |
-| `backoffMs` | `[60000, 120000, 300000, 600000, 900000]` | The ladder used only when the provider gives no reset time. The last value repeats. Entries must be between 250 and 86 400 000 ms. |
+| `backoffMs` | `[60000, 120000, 300000, 600000, 900000]` | The ladder used when the provider gives no reset time, and the ladder a transient provider outage walks on its own counter. The last value repeats. Entries must be between 250 and 86 400 000 ms. |
 | `maxCooldownMs` | `900000` | Cap on a ladder-derived cooldown. An authoritative provider reset is not capped. |
 | `jitterRatio` | `0.1` | Symmetric jitter as a fraction of the ladder value, clamped to `[0, 1]`. |
 | `failoverRetryDelayMs` | `250` | Delay for the first attempt on the fallback, so failover is immediate. |
-| `duplicateLimitWindowMs` | `5000` | Window in which a second limit signal counts as the same provider window and does not advance the ladder again. |
+| `duplicateLimitWindowMs` | `5000` | Window in which a second signal (a rate limit or a transient outage) counts as the same incident and does not advance its ladder again. |
 | `parkGraceMs` | `5000` | How long a prepared-but-undispatched fallback request may take before it is treated as parked. |
 | `switchConfirmMs` | `10000` | Window in which a model-selection event is attributed to this plugin rather than to the user. |
 | `probePrompt` | `"Reply with the single word: pong"` | The probe's prompt. Keep it tiny. |
@@ -76,15 +76,16 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | `logLevel` | `"info"` | `silent`, `error`, `info`, or `debug`. |
 
 `info` logs state transitions: free selected, rate limit detected, free route
-rejected (with the classification, HTTP status, and retry window), classification
-reason, retry/reset source, cooldown start and expiry, fallback selected, probe
-scheduled/started/limited, free recovered, safe switch back to free, explicit
-manual override detected, stale fallback continuation neutralized, duplicate
-continuation prevented — plus a `model transition` line for every switch.
+rejected, transient failure detected (with the classification, HTTP status, and
+window), classification reason, retry/reset source, cooldown start and expiry,
+fallback selected, probe scheduled/started/limited, free recovered, safe switch
+back to free, explicit manual override detected, stale fallback continuation
+neutralized, duplicate continuation prevented — plus a `model transition` line
+for every switch.
 
 `debug` adds per-request decisions: request preparation, dispatch, and every
-provider failure that was *not* classified as a rate limit, with the reason.
-Useful for "why did it not fail over?".
+provider failure that was *not* classified as a free-route availability failure,
+with the reason. Useful for "why did it not fail over?".
 
 Logs never contain prompts, response bodies, header maps, or credentials.
 

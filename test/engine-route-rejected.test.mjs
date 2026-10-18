@@ -123,7 +123,7 @@ describe("real-session free-route rejection", () => {
     assert.equal(engine.status().state, "FREE_HEALTHY");
     assert.equal(engine.status().cooldownReason, undefined);
     assert.equal(sessions.of("switchModel").length, 0);
-    assert.ok(log.has("provider failure is not a free-model rate limit"));
+    assert.ok(log.has("provider failure is not a free-model availability failure"));
   });
 
   it("does not fail over on a 401 or an invalid API key", async () => {

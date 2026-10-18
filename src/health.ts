@@ -5,16 +5,21 @@
  *
  *   FREE_HEALTHY  -- genuine rate limit -->  FREE_COOLDOWN (reason: rate-limit)
  *   FREE_HEALTHY  -- free-route gate    -->  FREE_COOLDOWN (reason: free-route)
+ *   FREE_HEALTHY  -- transient outage   -->  FREE_COOLDOWN (reason: transient-availability)
  *   FREE_COOLDOWN -- cooldown reached   -->  FREE_PROBE
  *   FREE_PROBE    -- success            -->  FREE_HEALTHY
  *   FREE_PROBE    -- rate limited       -->  FREE_COOLDOWN (level + 1)
+ *   FREE_PROBE    -- still unavailable  -->  FREE_COOLDOWN (transient failures + 1)
  *   FREE_PROBE    -- inconclusive       -->  FREE_HEALTHY (unconfirmed)
  *
- * Both causes share this one mechanism because both mean the same thing — the
- * free route cannot service a request right now. `cooldownReason` keeps the
- * diagnosis honest: a genuine rate limit carries the ladder, the reset source,
- * and `lastRateLimit*`, while OpenCode's free-tier gate arms the same cooldown
- * for `routeRejectRetryMs` without touching any rate-limit bookkeeping.
+ * All three causes share this one mechanism because all three mean the same
+ * thing — the free route cannot service a request right now. `cooldownReason`
+ * keeps the diagnosis honest: a genuine rate limit carries the ladder, the
+ * reset source, and `lastRateLimit*`; the free-tier gate arms the same cooldown
+ * for `routeRejectRetryMs`; a transient availability failure walks its own
+ * bounded ladder (`transientFailures`) and records `lastTransientAt` /
+ * `lastTransientType`, touching none of the rate-limit bookkeeping, so a
+ * provider 500 can never be presented as a quota event.
  *
  * An inconclusive probe means *unknown*, never *limited*: it re-arms the probe
  * on a bounded schedule but must never keep the free model blocked, because a
@@ -137,13 +142,22 @@ export function applyLimited(
       ...(health.lastProbeOutcome === undefined
         ? {}
         : { lastProbeOutcome: health.lastProbeOutcome }),
+      // The transient ladder is separate bookkeeping: a rate limit says nothing
+      // about the transient history, and vice versa.
+      ...(health.transientFailures === undefined
+        ? {}
+        : { transientFailures: health.transientFailures }),
+      ...(health.lastTransientAt === undefined ? {} : { lastTransientAt: health.lastTransientAt }),
+      ...(health.lastTransientType === undefined
+        ? {}
+        : { lastTransientType: health.lastTransientType }),
     },
     source,
     cooldownMs: until - input.now,
   };
 }
 
-/** Move to FREE_HEALTHY and reset the ladder. */
+/** Move to FREE_HEALTHY and reset the ladders. */
 export function markHealthy(health: HealthRecord, now: number): HealthRecord {
   return {
     schemaVersion: HEALTH_SCHEMA_VERSION,
@@ -154,12 +168,19 @@ export function markHealthy(health: HealthRecord, now: number): HealthRecord {
     probeBackoffUntil: undefined,
     inconclusiveProbes: 0,
     lastProbeOutcome: undefined,
+    // A confirmed success normalises the transient ladder: one isolated outage
+    // later starts from the short end again. The history stays visible.
+    transientFailures: 0,
     ...(health.lastRateLimitAt === undefined ? {} : { lastRateLimitAt: health.lastRateLimitAt }),
     ...(health.routeRejectedAt === undefined ? {} : { routeRejectedAt: health.routeRejectedAt }),
     ...(health.lastRateLimitType === undefined
       ? {}
       : { lastRateLimitType: health.lastRateLimitType }),
     ...(health.lastResetSource === undefined ? {} : { lastResetSource: health.lastResetSource }),
+    ...(health.lastTransientAt === undefined ? {} : { lastTransientAt: health.lastTransientAt }),
+    ...(health.lastTransientType === undefined
+      ? {}
+      : { lastTransientType: health.lastTransientType }),
   };
 }
 
@@ -235,8 +256,102 @@ export function applyFreeRouteUnavailable(
       ...(health.lastProbeOutcome === undefined
         ? {}
         : { lastProbeOutcome: health.lastProbeOutcome }),
+      ...(health.transientFailures === undefined
+        ? {}
+        : { transientFailures: health.transientFailures }),
+      ...(health.lastTransientAt === undefined ? {} : { lastTransientAt: health.lastTransientAt }),
+      ...(health.lastTransientType === undefined
+        ? {}
+        : { lastTransientType: health.lastTransientType }),
     },
     retryMs: until - input.now,
+  };
+}
+
+export interface TransientUnavailableInput {
+  readonly now: number;
+  /** Stable classification of the failure, for diagnostics. */
+  readonly reason: string;
+  readonly options: HealthOptions;
+  readonly random: () => number;
+  /** Shortest cooldown ever applied, so a tiny first rung still waits. */
+  readonly minCooldownMs?: number;
+}
+
+/**
+ * Arm the shared cooldown because the free route was temporarily unable to
+ * serve an otherwise valid request (provider/server 5xx, structured
+ * provider-internal, a qualifying transport or timeout failure).
+ *
+ * This is the *same* cooldown mechanism as a rate limit, because the
+ * consequence is the same: the free route cannot service a request until the
+ * bounded window elapses, and the existing recovery path then tests it. What
+ * must stay separate is the bookkeeping: the transient failure walks its own
+ * bounded ladder (`transientFailures`) and records `lastTransientAt` /
+ * `lastTransientType`, while the rate-limit ladder (`level`), the reset source,
+ * and `lastRateLimit*` are left exactly as they were — a provider 500 is never
+ * presented as a quota event, and a quota event is never advanced by a 500.
+ *
+ * The window is short by design: a single isolated provider hiccup must not
+ * block the free route for hours, so the first rung of the configured ladder
+ * applies. Repeated failures advance the ladder (bounded by
+ * `maxCooldownMs`), and a confirmed success resets it.
+ *
+ * A live cooldown from another cause is never shortened, and its label is not
+ * replaced while it still owns the deadline: the reason names the cause that
+ * governs the current window, so diagnostics stay truthful in both directions.
+ */
+export function applyTransientUnavailable(
+  health: HealthRecord,
+  input: TransientUnavailableInput,
+): { readonly health: HealthRecord; readonly cooldownMs: number } {
+  const failures = health.transientFailures ?? 0;
+  const ladderMs = backoffFor(failures, input.options.backoffMs);
+  const minCooldownMs = input.minCooldownMs ?? 1_000;
+  const jittered = withJitter(ladderMs, input.options.jitterRatio, input.random);
+  const bounded = Math.max(
+    minCooldownMs,
+    Math.min(jittered, Math.max(input.options.maxCooldownMs, minCooldownMs)),
+  );
+  const candidateUntil = input.now + bounded;
+  const existingUntil = health.cooldownUntil ?? 0;
+  const until = Math.max(existingUntil, candidateUntil);
+  const dominantElsewhere =
+    existingUntil > candidateUntil &&
+    health.cooldownReason !== undefined &&
+    health.cooldownReason !== "transient-availability";
+
+  return {
+    health: {
+      schemaVersion: HEALTH_SCHEMA_VERSION,
+      scope: health.scope,
+      state: "FREE_COOLDOWN",
+      cooldownUntil: until,
+      ...(dominantElsewhere
+        ? { cooldownReason: health.cooldownReason }
+        : { cooldownReason: "transient-availability" as const }),
+      transientFailures: Math.min(failures + 1, Math.max(1, input.options.backoffMs.length)),
+      lastTransientAt: input.now,
+      lastTransientType: input.reason,
+      ...(health.lastRateLimitAt === undefined ? {} : { lastRateLimitAt: health.lastRateLimitAt }),
+      ...(health.lastRateLimitType === undefined
+        ? {}
+        : { lastRateLimitType: health.lastRateLimitType }),
+      ...(health.lastResetSource === undefined ? {} : { lastResetSource: health.lastResetSource }),
+      ...(health.lastHealthyAt === undefined ? {} : { lastHealthyAt: health.lastHealthyAt }),
+      ...(health.routeRejectedAt === undefined ? {} : { routeRejectedAt: health.routeRejectedAt }),
+      ...(health.probeBackoffUntil === undefined
+        ? {}
+        : { probeBackoffUntil: health.probeBackoffUntil }),
+      ...(health.inconclusiveProbes === undefined
+        ? {}
+        : { inconclusiveProbes: health.inconclusiveProbes }),
+      ...(health.lastProbeOutcome === undefined
+        ? {}
+        : { lastProbeOutcome: health.lastProbeOutcome }),
+      level: health.level,
+    },
+    cooldownMs: until - input.now,
   };
 }
 
@@ -267,6 +382,13 @@ export function markProbeInconclusive(
       input.now + (Number.isFinite(input.retryMs) ? Math.max(1_000, input.retryMs) : 60_000),
     inconclusiveProbes: (health.inconclusiveProbes ?? 0) + 1,
     lastProbeOutcome: input.outcome,
+    ...(health.transientFailures === undefined
+      ? {}
+      : { transientFailures: health.transientFailures }),
+    ...(health.lastTransientAt === undefined ? {} : { lastTransientAt: health.lastTransientAt }),
+    ...(health.lastTransientType === undefined
+      ? {}
+      : { lastTransientType: health.lastTransientType }),
   };
 }
 
@@ -307,6 +429,13 @@ export function clearElapsedCooldown(health: HealthRecord, now: number): HealthR
       ? {}
       : { inconclusiveProbes: health.inconclusiveProbes }),
     ...(health.lastProbeOutcome === undefined ? {} : { lastProbeOutcome: health.lastProbeOutcome }),
+    ...(health.transientFailures === undefined
+      ? {}
+      : { transientFailures: health.transientFailures }),
+    ...(health.lastTransientAt === undefined ? {} : { lastTransientAt: health.lastTransientAt }),
+    ...(health.lastTransientType === undefined
+      ? {}
+      : { lastTransientType: health.lastTransientType }),
   };
 }
 
@@ -368,6 +497,15 @@ export function decodeHealth(value: unknown, scope: string): HealthRecord | unde
   const inconclusiveProbes =
     rawAttempts !== undefined && rawAttempts >= 0 ? Math.floor(rawAttempts) : undefined;
 
+  // Transient bookkeeping is validated the same way: a damaged counter must not
+  // throw away a real cooldown.
+  const rawFailures = nullableNumber("transientFailures");
+  const transientFailures =
+    rawFailures !== undefined && rawFailures >= 0 ? Math.floor(rawFailures) : undefined;
+  const rawTransientAt = nullableNumber("lastTransientAt");
+  const lastTransientAt =
+    rawTransientAt !== undefined && rawTransientAt >= 0 ? rawTransientAt : undefined;
+
   return {
     schemaVersion: HEALTH_SCHEMA_VERSION,
     scope,
@@ -378,6 +516,11 @@ export function decodeHealth(value: unknown, scope: string): HealthRecord | unde
     ...(inconclusiveProbes === undefined ? {} : { inconclusiveProbes }),
     ...(typeof record.lastProbeOutcome === "string"
       ? { lastProbeOutcome: record.lastProbeOutcome }
+      : {}),
+    ...(transientFailures === undefined ? {} : { transientFailures }),
+    ...(lastTransientAt === undefined ? {} : { lastTransientAt }),
+    ...(typeof record.lastTransientType === "string"
+      ? { lastTransientType: record.lastTransientType }
       : {}),
     ...(nullableNumber("lastRateLimitAt") === undefined
       ? {}
@@ -397,7 +540,7 @@ export function decodeHealth(value: unknown, scope: string): HealthRecord | unde
 }
 
 function isCooldownReason(value: unknown): value is CooldownReason {
-  return value === "rate-limit" || value === "free-route";
+  return value === "rate-limit" || value === "free-route" || value === "transient-availability";
 }
 
 function isResetSource(value: unknown): value is ResetSource {

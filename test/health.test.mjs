@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   applyFreeRouteUnavailable,
   applyLimited,
+  applyTransientUnavailable,
   backoffFor,
   clearElapsedCooldown,
   cooldownElapsed,
@@ -321,6 +322,142 @@ describe("free-route unavailability", () => {
     assert.equal(badAt.cooldownUntil, base.cooldownUntil);
     assert.equal(badAt.routeRejectedAt, undefined);
     assert.equal(badAt.cooldownReason, "rate-limit", "the valid field is untouched");
+  });
+});
+
+describe("transient availability", () => {
+  function transient(health, overrides = {}) {
+    return applyTransientUnavailable(health, {
+      now: NOW,
+      reason: "failover-http-500",
+      options: OPTIONS,
+      random: () => 0.5,
+      ...overrides,
+    });
+  }
+
+  it("arms the shared cooldown on its own bounded ladder", () => {
+    const { health, cooldownMs } = transient(initialHealth(SCOPE, NOW));
+    assert.equal(health.state, "FREE_COOLDOWN");
+    assert.equal(health.cooldownReason, "transient-availability");
+    assert.equal(health.cooldownUntil, NOW + 1_000);
+    assert.equal(cooldownMs, 1_000, "the first rung of the bounded ladder");
+    assert.equal(health.transientFailures, 1);
+    assert.equal(health.lastTransientAt, NOW);
+    assert.equal(health.lastTransientType, "failover-http-500");
+    assert.equal(inCooldown(health, NOW), true);
+    assert.equal(remainingCooldown(health, NOW), 1_000);
+    // Nothing in the rate-limit bookkeeping is touched.
+    assert.equal(health.level, 0);
+    assert.equal(health.lastRateLimitAt, undefined);
+    assert.equal(health.lastRateLimitType, undefined);
+    assert.equal(health.lastResetSource, undefined);
+  });
+
+  it("walks the bounded ladder across repeated failures and clamps", () => {
+    let health = initialHealth(SCOPE, NOW);
+    const observed = [];
+    for (let index = 0; index < 5; index += 1) {
+      const applied = transient(health, { now: NOW + index * 100_000 });
+      observed.push(applied.cooldownMs);
+      health = applied.health;
+    }
+    assert.deepEqual(observed, [1_000, 2_000, 5_000, 5_000, 5_000]);
+    assert.equal(health.transientFailures, 3, "clamped at the ladder length");
+    assert.ok(Math.max(...observed) <= OPTIONS.maxCooldownMs);
+  });
+
+  it("never shortens or relabels a live cooldown from another cause", () => {
+    const { health: cooling } = applyLimited(initialHealth(SCOPE, NOW), {
+      now: NOW,
+      reset: { until: NOW + 600_000, source: "retry-after" },
+      reason: "test",
+      options: OPTIONS,
+      random: () => 0.5,
+    });
+    const { health } = transient(cooling);
+    assert.equal(health.cooldownUntil, NOW + 600_000, "the later deadline wins");
+    assert.equal(health.cooldownReason, "rate-limit", "the deadline owner keeps the label");
+    assert.equal(health.lastRateLimitAt, NOW, "the genuine limit stays recorded");
+    assert.equal(health.transientFailures, 1, "the outage is still recorded separately");
+    assert.equal(health.lastTransientType, "failover-http-500");
+  });
+
+  it("a confirmed success resets the transient ladder", () => {
+    const { health } = transient(initialHealth(SCOPE, NOW));
+    const recovered = markHealthy(health, NOW + 5_000);
+    assert.equal(recovered.transientFailures, 0);
+    assert.equal(recovered.lastHealthyAt, NOW + 5_000);
+    assert.equal(recovered.lastTransientAt, NOW, "the outage stays visible as history");
+    assert.equal(recovered.lastTransientType, "failover-http-500");
+    // A new isolated outage starts from the short end again.
+    assert.equal(transient(recovered, { now: NOW + 10_000 }).cooldownMs, 1_000);
+  });
+
+  it("carries the transient bookkeeping through every other transition", () => {
+    const { health } = transient(initialHealth(SCOPE, NOW));
+    const limited = applyLimited(health, {
+      now: NOW + 1_000,
+      reason: "test",
+      options: OPTIONS,
+      random: () => 0.5,
+    }).health;
+    assert.equal(limited.transientFailures, 1);
+    assert.equal(limited.lastTransientAt, NOW);
+
+    const deferred = markProbeInconclusive(limited, {
+      now: NOW + 2_000,
+      retryMs: 30_000,
+      outcome: "inconclusive:unclassified-message",
+    });
+    assert.equal(deferred.transientFailures, 1);
+    assert.equal(deferred.lastTransientAt, NOW);
+    assert.equal(deferred.lastTransientType, "failover-http-500");
+
+    const cleared = clearElapsedCooldown(deferred, NOW + 3_000);
+    assert.equal(cleared.state, "FREE_HEALTHY");
+    assert.equal(cleared.transientFailures, 1, "only a confirmed success resets the ladder");
+    assert.equal(cleared.lastTransientAt, NOW);
+
+    const refused = applyFreeRouteUnavailable(cleared, { now: NOW + 4_000, retryMs: 5_000 }).health;
+    assert.equal(refused.transientFailures, 1);
+    assert.equal(refused.lastTransientType, "failover-http-500");
+  });
+
+  it("round-trips the transient record and validates damaged fields", () => {
+    const { health } = transient(initialHealth(SCOPE, NOW));
+    const decoded = decodeHealth(JSON.parse(JSON.stringify(health)), SCOPE);
+    assert.deepEqual(decoded, health);
+    assert.equal(decoded.cooldownReason, "transient-availability");
+
+    for (const damaged of [
+      { transientFailures: -1 },
+      { transientFailures: "many" },
+      { lastTransientAt: "soon" },
+      { lastTransientType: 42 },
+    ]) {
+      const dropped = decodeHealth({ ...health, ...damaged }, SCOPE);
+      assert.equal(dropped.state, "FREE_COOLDOWN", JSON.stringify(damaged));
+      assert.equal(dropped.cooldownUntil, health.cooldownUntil, JSON.stringify(damaged));
+      assert.equal(
+        dropped.cooldownReason,
+        "transient-availability",
+        `the valid reason is untouched by ${JSON.stringify(damaged)}`,
+      );
+      // Only the damaged field is dropped; the rest of the record survives.
+      for (const key of Object.keys(damaged)) {
+        assert.equal(dropped[key], undefined, `${key} must be dropped`);
+      }
+      const kept = Object.keys(health).filter((key) => !(key in damaged));
+      for (const key of kept) {
+        if (key === "cooldownReason") continue;
+        assert.deepEqual(dropped[key], health[key], `${key} must survive`);
+      }
+    }
+
+    const unknownReason = decodeHealth({ ...health, cooldownReason: "provider-whatever" }, SCOPE);
+    assert.equal(unknownReason.state, "FREE_COOLDOWN");
+    assert.equal(unknownReason.cooldownReason, undefined);
   });
 });
 

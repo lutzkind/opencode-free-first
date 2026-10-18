@@ -86,14 +86,56 @@ that happens to hit only the title request leaves the title missing and the turn
 runs normally. The failover covers the agent loop and compaction requests, which
 are the requests that carry the turn.
 
+## A provider 500 (or 502/503/504, or a transport failure) killed the turn
+
+The free route was temporarily unable to serve an otherwise valid request — a
+provider/server failure, a structured `provider.internal`, a structured provider
+timeout, or a transport failure OpenCode treats as transient (`ECONNRESET`,
+`fetch failed`, a timeout wording, …). Since v0.1.10 the plugin fails the same
+turn over to the fallback, exactly like a rate limit, and returns the session to
+the free model once the bounded transient window expires. You should see:
+
+```
+[opencode-free-first] free route transient failure detected { classification: "http-500", category: "server", type: "provider.internal", status: 500, cooldown: "1m", transientFailures: 1 }
+[opencode-free-first] model transition { trigger: "availability-failover", model: "<fallback>" }
+[opencode-free-first] fallback selected { … trigger: "availability-failover", retryDelayMs: 250 }
+```
+
+and later, when the window expires, either `recovery probe succeeded` /
+`returned to free model`, or — if the provider is still down —
+`recovery probe hit a transient availability failure`, which re-arms the transient
+cooldown on the next ladder rung and keeps the fallback session untouched.
+
+`status` shows the cause while the window is active:
+
+- `state: "FREE_COOLDOWN"`, `cooldownReason: "transient-availability"`,
+  `transientFailures` (the ladder position), `lastTransientAt` /
+  `lastTransientType` (the stable classification, e.g. `failover-http-500`).
+- No `lastRateLimitAt` / `lastRateLimitType` / `lastResetSource`: a 500 is never
+  reported as a quota event.
+- The status line reads `FREE unavailable: transient provider failure (retry in 1m)`.
+
+One isolated outage blocks the route for the first rung of the bounded ladder
+(default 1 minute); repeated outages back off further, capped by `maxCooldownMs`.
+A confirmed success resets the counter. An outage that arrives while a
+rate-limit window is still the longer one is recorded without relabelling it:
+`cooldownReason` always names the cause that owns the current deadline, and the
+two causes never share a ladder.
+
+Request, account, and configuration defects are still **not** this: a `400`, a
+`401`, a generic `403`, an invalid key, an invalid model, a content filter, a
+context-length error, a tool failure, or a plugin bug keeps its real type, does
+not fail over, and surfaces unchanged.
+
 ## A rate limit is hit but the session does not fail over
 
 Check the debug log for one of these:
 
-- `provider failure is not a free-model rate limit` — classification declined.
-  The detail shows the `type`, `status`, and `classification` reason. If a
-  provider returns something unexpected that is genuinely a limit, add it as a
-  fixture-backed test rather than loosening the parser ad hoc.
+- `provider failure is not a free-model availability failure` — classification
+  declined. The detail shows the `type`, `status`, `classification`, and
+  `availability` reasons. If a provider returns something unexpected that is
+  genuinely a limit or a transient outage, add it as a fixture-backed test rather
+  than loosening the parser ad hoc.
 - `session is not managed by free-first; leaving its model unchanged` — the
   session was repointed by hand, so management ended.
 - `no fallback model available; surfacing the free-model failure` — no
@@ -123,15 +165,21 @@ Check `lastProbeOutcome` and `probeBackoffUntil` in `status`:
   passively, and the free model is used again at the next real model call after the
   cooldown expires.
 - `inconclusive:…` repeated with a growing delay means probes are failing for a
-  reason that is not a limit (transport, 5xx). The free model stays usable
-  regardless.
+  reason that is neither exhaustion nor a recognised transient outage — an
+  unclassified failure. The free model stays usable regardless.
+- `transientFailures` / `lastTransientType` with a growing `cooldownMs` means the
+  provider route is genuinely down right now (`probe-http-503`,
+  `probe-structured-provider-internal`, …). That is not a probe defect: the
+  waiting sessions correctly stay on the fallback, and the window backs off on the
+  bounded ladder until a probe succeeds.
 
 If new sessions are *still* going to the fallback, the cooldown is still believed
 to be active. Confirm with `status`: `cooldownMs > 0` means a real cooldown is
-running, and `lastRateLimitAt` tells you when it was established. A `lastRateLimitAt`
-from before the provider's reset means you are looking at a stale cooldown — lift it
-with the `reset` action below, and report it: only a genuine limit should ever arm a
-cooldown.
+running, and `lastRateLimitAt` / `lastTransientAt` tell you when it was
+established, and by which cause (`cooldownReason`). A `lastRateLimitAt` from
+before the provider's reset means you are looking at a stale cooldown — lift it
+with the `reset` action below, and report it: only a genuine limit or a positive
+outage should ever arm a cooldown.
 
 A cooldown whose timestamp has passed is dropped automatically, and a stale
 instance cannot resurrect one: `status` re-reads shared health before reporting, and
@@ -149,11 +197,13 @@ Recovery has not been confirmed yet. Look at:
     provider's own number.
   - `backoff` — no reset metadata was supplied, so the ladder applies.
 - `recovery probe rate-limited` — the free model is still limited; the cooldown
-  was extended and the ladder advanced.
-- `recovery probe inconclusive` — the probe failed for a reason that is not
-  exhaustion (a transport error, a 5xx, a bad route). Free health is unchanged and
-  a short retry was armed. This one is worth investigating: it usually means the
-  free model route itself is broken.
+  was extended and the rate-limit ladder advanced.
+- `recovery probe hit a transient availability failure` — the provider route is
+  still down (not a limit); the transient cooldown was re-armed on the next ladder
+  rung and the waiting sessions were left untouched.
+- `recovery probe inconclusive` — the probe failed for a reason that is neither
+  exhaustion nor a recognised outage (an unclassified failure). Free health is
+  unchanged and a short retry was armed.
 - With `"probe": false`, recovery is passive. A session that is idle will stay on
   the fallback until it makes another model call.
 
@@ -197,12 +247,14 @@ in the sessions.
 ## Switch churn
 
 Use `status().transitions`. A healthy free period records **zero** transitions. A
-complete free-limit cycle records exactly two: `failover` and one of
-`probe-recovery` / `passive-recovery` / `park-preemption`. A free-route rejection
-cycle is the same shape with the `route-reject-failover` trigger. Anything more
-means a repeated refusal is being signalled faster than the cooldown, which the
-debug log shows as `duplicate: true` on the second `free rate limit detected` (or
-on the second `free route rejected`).
+complete free-availability cycle records exactly two: one failover trigger
+(`failover`, `route-reject-failover`, or `availability-failover`) and one of
+`probe-recovery` / `passive-recovery` / `park-preemption`. Anything more means a
+repeated signal is being recognised faster than the cooldown, which the debug log
+shows as `duplicate: true` on the second `free rate limit detected`, `free route
+rejected`, or `free route transient failure detected`. Check `cooldownReason` and
+the matching bookkeeping fields (`level` for limits, `transientFailures` for
+outages) to see which cause is currently in charge.
 
 ## Two plugin instances, or a stale version
 

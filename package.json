@@ -1,7 +1,7 @@
 {
   "name": "opencode-free-first",
-  "version": "0.1.9",
-  "description": "OpenCode v2 plugin that prefers a free model and fails over and recovers around free-tier rate limits.",
+  "version": "0.1.10",
+  "description": "OpenCode v2 plugin that prefers a free model and fails over and recovers around free-route availability problems (rate limits, the free-tier gate, and transient provider outages).",
   "author": "Lutz Kind",
   "license": "MIT",
   "type": "module",

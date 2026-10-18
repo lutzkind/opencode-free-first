@@ -82,7 +82,9 @@ describe("recovery", () => {
 
   it("treats an inconclusive probe as unknown and returns the session to the free model", async () => {
     const generate = new FakeGenerate();
-    generate.error = { type: "provider.internal", status: 500, message: "internal server error" };
+    // `provider.unknown` without a status is genuinely unclassified: not a
+    // limit, not a recognised transient availability failure.
+    generate.error = { type: "provider.unknown", message: "the provider returned an odd shape" };
     const { engine, clock, sessions, log } = await boot({ generate });
     await failover(engine, "ses_a");
     await clock.advance(1_500);
@@ -103,7 +105,7 @@ describe("recovery", () => {
 
   it("does not keep probing inside the back-off window", async () => {
     const generate = new FakeGenerate();
-    generate.error = { type: "provider.internal", status: 500, message: "internal server error" };
+    generate.error = { type: "provider.unknown", message: "the provider returned an odd shape" };
     const { engine, clock } = await boot({ generate });
     await failover(engine, "ses_a");
     await clock.advance(1_500);
@@ -118,7 +120,7 @@ describe("recovery", () => {
 
   it("probes again once the probe back-off has elapsed", async () => {
     const generate = new FakeGenerate();
-    generate.error = { type: "provider.transport", message: "socket hang up" };
+    generate.error = { type: "provider.unknown", message: "the provider returned an odd shape" };
     const { engine, clock } = await boot({ generate });
     await failover(engine, "ses_a");
     await clock.advance(1_500);

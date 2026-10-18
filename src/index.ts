@@ -6,11 +6,14 @@ export type {
   ProviderErrorView,
   ResetContext,
   ResetHint,
+  TransientCategory,
+  TransientClassification,
 } from "./classify.js";
 export {
   classifyFreeLimit,
   classifyFreeRouteRejection,
   classifyProbeFailure,
+  classifyTransientAvailability,
   extractReset,
   parseDelay,
   parseMilliseconds,
@@ -44,10 +47,16 @@ export type {
   StateStore,
 } from "./engine.js";
 export { FreeFirstEngine, toProviderErrorView } from "./engine.js";
-export type { FreeRouteUnavailableInput, HealthOptions, LimitedInput } from "./health.js";
+export type {
+  FreeRouteUnavailableInput,
+  HealthOptions,
+  LimitedInput,
+  TransientUnavailableInput,
+} from "./health.js";
 export {
   applyFreeRouteUnavailable,
   applyLimited,
+  applyTransientUnavailable,
   backoffFor,
   clearElapsedCooldown,
   cooldownElapsed,

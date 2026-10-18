@@ -5,6 +5,12 @@ it, so each item needs evidence before it is implemented.
 
 ## Recently closed
 
+- **Transient free-route availability failures (v0.1.10).** Closed by one
+  `transient-availability` category (provider 5xx, structured provider-internal/
+  timeout, qualifying transport failures) that reuses the shared cooldown with its
+  own bounded ladder, plus a `transient` probe outcome. Supersedes the
+  rate-limit-and-gate-only failover policy.
+
 - **Compaction against a known cooldown (v0.1.8).** Closed by keeping the
   sessions that can reach a step boundary on the fallback while a cooldown is
   active, and by never retrying a compaction on a model that just limited.

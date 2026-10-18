@@ -4,6 +4,7 @@ import {
   classifyFreeLimit,
   classifyFreeRouteRejection,
   classifyProbeFailure,
+  classifyTransientAvailability,
   extractReset,
   parseDelay,
   parseResetValue,
@@ -173,6 +174,162 @@ describe("classifyFreeRouteRejection", () => {
     assert.equal(classifyFreeRouteRejection({ message: FREE_ROUTE_GATE }).rejected, true);
     // And the rate-limit classifier never sees it as exhaustion.
     assert.equal(classifyFreeLimit({ message: FREE_ROUTE_GATE }).limited, false);
+  });
+});
+
+describe("classifyTransientAvailability", () => {
+  it("recognises the observed live provider 500 and every 5xx availability status", () => {
+    // The live incident (2026-10-18) arrived exactly like this: an
+    // `AI.Error.ProviderInternal` carrying HTTP 500.
+    assert.deepEqual(
+      classifyTransientAvailability({
+        type: "provider.internal",
+        status: 500,
+        message: "Provider request failed with HTTP 500",
+      }),
+      { transient: true, category: "server", reason: "http-500" },
+    );
+    for (const status of [502, 503, 504]) {
+      const verdict = classifyTransientAvailability({
+        type: "provider.internal",
+        status,
+        message: `Provider request failed with HTTP ${status}`,
+      });
+      assert.equal(verdict.transient, true, `status ${status}`);
+      assert.equal(verdict.category, "server", `status ${status}`);
+      assert.equal(verdict.reason, `http-${status}`, `status ${status}`);
+    }
+    // The status alone is enough evidence when OpenCode preserved one.
+    assert.deepEqual(classifyTransientAvailability({ status: 503 }), {
+      transient: true,
+      category: "server",
+      reason: "http-503",
+    });
+  });
+
+  it("recognises structured provider-internal and timeout types without a status", () => {
+    assert.deepEqual(
+      classifyTransientAvailability({
+        type: "provider.internal",
+        message: "Provider reported a network error (finish_reason: network_error)",
+      }),
+      { transient: true, category: "server", reason: "structured-provider-internal" },
+    );
+    assert.deepEqual(
+      classifyTransientAvailability({
+        type: "provider.timeout",
+        message: "Timed out waiting for response headers",
+      }),
+      { transient: true, category: "timeout", reason: "structured-timeout" },
+    );
+  });
+
+  it("qualifies exactly the transport failures OpenCode itself treats as transient", () => {
+    const codes = [
+      "ECONNRESET: socket hang up",
+      "ECONNREFUSED: connect failed",
+      "ETIMEDOUT",
+      "EPIPE: broken pipe",
+      "ConnectionRefused: Unable to connect",
+      "ConnectionClosed: the connection was closed",
+      "FailedToOpenSocket",
+      "UND_ERR_SOCKET: other side closed",
+    ];
+    for (const message of codes) {
+      const verdict = classifyTransientAvailability({ type: "provider.transport", message });
+      assert.equal(verdict.transient, true, message);
+      assert.equal(verdict.category, "transport", message);
+    }
+    const phrases = [
+      "fetch failed",
+      "failed to fetch",
+      "terminated",
+      "other side closed",
+      "sse read timed out",
+      "response headers timed out",
+      "socket hang up",
+      "the request timed out",
+    ];
+    for (const message of phrases) {
+      assert.equal(
+        classifyTransientAvailability({ type: "provider.transport", message }).transient,
+        true,
+        message,
+      );
+    }
+  });
+
+  it("keeps request, account, configuration, and plugin defects visible", () => {
+    const visible = [
+      { type: "provider.invalid-request", status: 400, message: "bad request" },
+      { type: "provider.auth", status: 401, message: "authentication failed" },
+      { type: "provider.auth", status: 403, message: "Forbidden" },
+      { type: "provider.auth", status: 400, message: "Invalid API key provided" },
+      { type: "provider.no-route", message: "unsupported provider configuration" },
+      { type: "provider.content-filter", message: "content policy violation" },
+      { type: "provider.invalid-request", status: 400, message: "maximum context length exceeded" },
+      { type: "tool.execution", message: "tool failed" },
+      { type: "unknown", message: "TypeError: x is not a function" },
+      { type: "provider.unsupported-operation", message: "unsupported operation" },
+      { type: "provider.unknown", message: "the provider returned an odd shape" },
+      { type: "provider.invalid-output", message: "incomplete stream" },
+      { type: "provider.transport", message: "invalid URL" },
+      {},
+    ];
+    for (const error of visible) {
+      assert.equal(classifyTransientAvailability(error).transient, false, JSON.stringify(error));
+    }
+    assert.equal(classifyTransientAvailability(undefined).transient, false);
+    // A structured non-transient type wins over a 5xx-looking status.
+    assert.equal(
+      classifyTransientAvailability({
+        type: "provider.invalid-request",
+        status: 500,
+        message: "upstream returned 500",
+      }).transient,
+      false,
+    );
+    // A definite client status vetoes an unqualified transport message.
+    assert.equal(
+      classifyTransientAvailability({
+        type: "provider.transport",
+        status: 400,
+        message: "timed out",
+      }).transient,
+      false,
+    );
+  });
+
+  it("never classifies exhaustion as a transient availability failure", () => {
+    for (const error of [
+      { status: 429 },
+      { type: "provider.rate-limit", status: 429 },
+      { type: "provider.quota", message: "quota exceeded" },
+    ]) {
+      assert.equal(classifyTransientAvailability(error).transient, false, JSON.stringify(error));
+    }
+  });
+
+  it("reports a transient outage on the recovery probe path", () => {
+    assert.equal(
+      classifyProbeFailure({ type: "provider.internal", status: 500, message: "HTTP 500" }),
+      "transient",
+    );
+    assert.equal(
+      classifyProbeFailure({ type: "provider.transport", message: "ECONNRESET: socket hang up" }),
+      "transient",
+    );
+    // The probe-path refusal keeps priority: it is a property of the probe
+    // mechanism, not of free-model health.
+    assert.equal(
+      classifyProbeFailure({ tag: "Generate.UnavailableError", message: FREE_ROUTE_GATE }),
+      "unsupported",
+    );
+    assert.equal(classifyProbeFailure({ type: "provider.auth", status: 401 }), "unsupported");
+    assert.equal(
+      classifyProbeFailure({ type: "provider.unknown", message: "odd shape" }),
+      "inconclusive",
+    );
   });
 });
 

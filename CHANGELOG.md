@@ -3,6 +3,108 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] — 2026-10-18
+
+### Fixed
+
+- **A temporary provider outage of the free route no longer kills the turn.**
+  When the free model answered an otherwise valid request with a provider/server
+  failure, the error was left to surface even though the configured fallback was
+  available. The live incident (2026-10-18): the free route returned
+  `AI.Error.ProviderInternal` ("Provider request failed with HTTP 500"), the
+  session's drain failed, and the turn died — while the paid route was healthy.
+  The previous policy only failed over on a rate limit or OpenCode's free-tier
+  eligibility gate; that policy is **superseded**.
+
+  Temporary free-route availability problems now fail over in the same turn on
+  one unified category, `transient-availability`, while request/account/
+  configuration/plugin defects keep their real failure type and stay visible.
+  The same session and turn continue on the configured fallback with one cheap
+  retry — no second prompt, no replayed tool calls, no new session — and the
+  existing recovery path returns the session to the free model once the route
+  recovers.
+
+- **An elapsed cooldown with no waiting session no longer spins the scheduler.**
+  When a cooldown was recorded but nothing was switched to the fallback (an
+  opted-out session observed the failure, or no fallback could be resolved), the
+  elapsed record was never normalised: `status` kept reporting `FREE_PROBE` and
+  the scheduler re-armed a 1 ms wake-up for a boundary already behind it —
+  measured at 1000 wake-ups per second. Recovery now drops the elapsed record on
+  every branch before deciding anything else. Dropping it is not a claimed
+  recovery (`lastHealthyAt` is untouched), and the ladder positions and history
+  survive.
+
+### Added
+
+- **`transient-availability`**: the third cooldown cause, armed by provider/
+  server `500`/`502`/`503`/`504`, OpenCode's structured `provider.internal`
+  (only constructed for server-side or network-error paths) or `provider.timeout`,
+  and the transport/connectivity failures OpenCode itself treats as transient
+  (`ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `EPIPE`, `ConnectionRefused`,
+  `ConnectionClosed`, `FailedToOpenSocket`, any `UND_ERR_*`, `fetch failed`,
+  `terminated`, `other side closed`, `socket hang up`, `sse read timed out`,
+  `response headers timed out`, a timeout wording).
+- `classifyTransientAvailability`, exported from `./core` with
+  `applyTransientUnavailable`.
+- A separate bounded transient ladder (`transientFailures`, `lastTransientAt`,
+  `lastTransientType`) over the configured `backoffMs`, so one isolated outage
+  blocks the free route for one short rung — never hours — and repeated outages
+  back off further, capped by `maxCooldownMs`. A confirmed success resets it. The
+  rate-limit ladder, the reset source, and `lastRateLimit*` are never touched by
+  an outage, and vice versa: a provider 500 can never be presented as, or
+  recorded as, a quota event.
+- The recovery probe gains a `transient` outcome: a probe that hits a genuine
+  outage re-arms the transient cooldown on the next ladder rung and leaves the
+  waiting sessions on the fallback instead of thrashing between free and paid.
+  Probe outcome `unsupported` and `inconclusive` keep their existing fail-open
+  handling; the host-refused probe path stays passive-only.
+- `status` fields `transientFailures`, `lastTransientAt`, and
+  `lastTransientType` (e.g. `failover-http-500`,
+  `failover-structured-provider-internal`, `failover-transport-econnreset`,
+  `probe-http-503`), and the status line
+  `FREE unavailable: transient provider failure (retry in 1m)`.
+- `model transition` entries use the `availability-failover` trigger for this
+  cause.
+- Shared-state semantics: the transient ladder and timestamps are adopted across
+  instances like the cooldown itself, a recovery confirmed elsewhere also clears
+  them, and a transient outage that arrives while a longer rate-limit or
+  free-route cooldown is live is recorded without relabelling or shortening it —
+  `cooldownReason` always names the cause that owns the current deadline.
+- 53 unit tests across the classifier, the health state machine, and the engine
+  (the 5xx/structured/transport failover matrix, the must-not-fail-over matrix,
+  bookkeeping separation, duplicate suppression, bounded escalation, probe
+  re-arm, compaction suppression, no-fallback and opt-out sessions, persistence,
+  restart, cross-instance adoption, and the scheduler-hygiene regression), plus 2
+  live CLI cases: a provider 500 fails the same turn over with the continuation
+  carrying the same conversation and tool set, and the free route returns
+  automatically once the outage clears.
+
+### Changed
+
+- The retry-hook debug line is now
+  `provider failure is not a free-model availability failure` and reports both
+  the rate-limit verdict and the transient-availability verdict.
+- The compaction log for a suppressed retry names the cause that suppressed it
+  (`a just-limited free model`, `a free route that just rejected it`, or
+  `a transiently unavailable free model`).
+
+### Documentation
+
+- `ARCHITECTURE.md`, `DECISIONS.md` (028–030), `README.md`,
+  `docs/state-machine.md`, `docs/configuration.md`, `docs/troubleshooting.md`,
+  `docs/testing.md`, and `docs/coexistence.md` now state the governing rule
+  explicitly: temporary free-route availability problems use the paid fallback;
+  permanent request/account/configuration/plugin failures remain visible. The
+  previous rate-limit-only policy is recorded as superseded rather than left
+  contradictory.
+
+### Evidence
+
+- 287 unit tests (was 234), 16 integration cases (was 14; real `opencode` CLI,
+  real `opencode-offpeak`, deterministic mock provider), the `opencode-offpeak`
+  regression suite (134/134), `npm run lint`, `npm run typecheck`, and
+  `npm pack --dry-run` all pass.
+
 ## [0.1.9] — 2026-10-17
 
 ### Fixed
@@ -335,6 +437,7 @@ First public release. Verified against OpenCode `2.0.27` with `@opencode/plugin`
   the session, model, and continuation are already correct. The TUI continues the
   resumed step normally.
 
+[0.1.10]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.10
 [0.1.9]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.9
 [0.1.8]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.8
 [0.1.7]: https://github.com/lutzkind/opencode-free-first/releases/tag/v0.1.7

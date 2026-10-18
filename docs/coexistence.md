@@ -47,6 +47,12 @@ failed free request — one prompt, no replay. The paid route flows through norm
 OpenCode routing, so the policy plugin sees it exactly as it would see any other
 paid request.
 
+The same sequence covers a temporarily unavailable free route — OpenCode's
+free-tier eligibility gate or a transient provider outage (5xx, transport). The
+cause is recorded separately (`cooldownReason`) and the recovery window differs,
+but there is one failover mechanism, so the policy plugin still sees only an
+ordinary paid request.
+
 ### 3 — Free model recovers while the paid route is parked
 
 The fallback route is peak-priced, so the policy plugin holds the paid request

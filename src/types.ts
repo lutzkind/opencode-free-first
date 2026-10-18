@@ -36,11 +36,12 @@ export type FreeState = "FREE_HEALTHY" | "FREE_COOLDOWN" | "FREE_PROBE";
 
 /**
  * Why the free route is currently unavailable. A genuine provider rate limit
- * (`rate-limit`) and OpenCode's free-tier eligibility gate (`free-route`) are
- * different causes with the same consequence: they share the one cooldown
+ * (`rate-limit`), OpenCode's free-tier eligibility gate (`free-route`), and a
+ * transient provider/server availability failure (`transient-availability`)
+ * are different causes with the same consequence: they share the one cooldown
  * mechanism, but diagnostics must never present one as the other.
  */
-export type CooldownReason = "rate-limit" | "free-route";
+export type CooldownReason = "rate-limit" | "free-route" | "transient-availability";
 
 /** How a managed session currently routes its model calls. */
 export type SessionRoute = "PRIMARY" | "FALLBACK";
@@ -69,6 +70,17 @@ export interface HealthRecord {
    * episode, for diagnostics ("route-rejected since when").
    */
   readonly routeRejectedAt?: number | undefined;
+  /**
+   * Consecutive transient availability failures (provider 5xx, structured
+   * provider-internal, qualifying transport/timeout). Position on the bounded
+   * transient backoff ladder. Kept strictly separate from the rate-limit ladder
+   * (`level`), so a provider 500 can never masquerade as a quota event.
+   */
+  readonly transientFailures?: number | undefined;
+  /** Absolute time of the last transient availability failure, for dedup. */
+  readonly lastTransientAt?: number | undefined;
+  /** Stable classification of the last transient failure, for diagnostics. */
+  readonly lastTransientType?: string | undefined;
   /**
    * Absolute time before which the recovery probe must stay quiet. A probe
    * back-off never blocks the free model; it only schedules the next attempt.

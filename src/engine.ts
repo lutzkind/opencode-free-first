@@ -13,17 +13,25 @@
  * tests with no provider traffic.
  */
 
-import type { FreeRouteRejection, ProbeOutcome, ProviderErrorView, ResetHint } from "./classify.js";
+import type {
+  FreeRouteRejection,
+  ProbeOutcome,
+  ProviderErrorView,
+  ResetHint,
+  TransientClassification,
+} from "./classify.js";
 import {
   classifyFreeLimit,
   classifyFreeRouteRejection,
   classifyProbeFailure,
+  classifyTransientAvailability,
   extractReset,
 } from "./classify.js";
 import type { FreeFirstConfig } from "./config.js";
 import {
   applyFreeRouteUnavailable,
   applyLimited,
+  applyTransientUnavailable,
   backoffFor,
   clearElapsedCooldown,
   cooldownElapsed,
@@ -150,10 +158,16 @@ export interface EngineStatus {
   readonly lastRateLimitType?: string;
   readonly lastResetSource?: string;
   readonly lastHealthyAt?: number;
-  /** Why the current cooldown was armed: a rate limit or the free-route gate. */
+  /** Why the current cooldown was armed: a rate limit, the gate, or a transient outage. */
   readonly cooldownReason?: string;
   /** First recognised free-route rejection of the current episode. */
   readonly routeRejectedAt?: number;
+  /** Consecutive transient availability failures (its own bounded ladder). */
+  readonly transientFailures?: number;
+  /** When the last transient availability failure was seen. */
+  readonly lastTransientAt?: number;
+  /** Stable classification of the last transient failure. */
+  readonly lastTransientType?: string;
   readonly probedAt?: number;
   readonly probeBackoffUntil?: number;
   readonly inconclusiveProbes?: number;
@@ -326,6 +340,18 @@ export class FreeFirstEngine {
             ...(restored.lastHealthyAt === undefined
               ? {}
               : { lastHealthyAt: restored.lastHealthyAt }),
+            ...(restored.routeRejectedAt === undefined
+              ? {}
+              : { routeRejectedAt: restored.routeRejectedAt }),
+            ...(restored.transientFailures === undefined
+              ? {}
+              : { transientFailures: restored.transientFailures }),
+            ...(restored.lastTransientAt === undefined
+              ? {}
+              : { lastTransientAt: restored.lastTransientAt }),
+            ...(restored.lastTransientType === undefined
+              ? {}
+              : { lastTransientType: restored.lastTransientType }),
           };
         }
       }
@@ -601,24 +627,34 @@ export class FreeFirstEngine {
     const classification = classifyFreeLimit(input.error);
     let trigger = "failover";
     if (!classification.limited) {
-      // Not a rate limit. The one other cause this plugin acts on is OpenCode's
-      // own free-tier eligibility gate; a 401, a generic 403, an invalid key,
-      // or a configuration error must never reach the failover below.
+      // Not a rate limit. Two other causes reach the failover: OpenCode's own
+      // free-tier eligibility gate (the free *route* is refused) and a
+      // transient availability failure (the free route cannot serve an
+      // otherwise valid request right now). A 401, a generic 403, an invalid
+      // key, a malformed request, a content filter, a context-length error, a
+      // tool failure, or a configuration error must never reach it.
       const rejection = classifyFreeRouteRejection(input.error);
-      if (!rejection.rejected) {
-        if (this.#logger.enabled("debug")) {
-          this.#log("debug", "provider failure is not a free-model rate limit", {
-            sessionID: input.sessionID,
-            type: input.error.type ?? "unknown",
-            status: input.error.status ?? 0,
-            classification: classification.reason,
-            attempt: input.attempt,
-          });
+      if (rejection.rejected) {
+        await this.#recordFreeRouteUnavailable(input, rejection, now);
+        trigger = "route-reject-failover";
+      } else {
+        const transient = classifyTransientAvailability(input.error);
+        if (!transient.transient) {
+          if (this.#logger.enabled("debug")) {
+            this.#log("debug", "provider failure is not a free-model availability failure", {
+              sessionID: input.sessionID,
+              type: input.error.type ?? "unknown",
+              status: input.error.status ?? 0,
+              classification: classification.reason,
+              availability: transient.reason,
+              attempt: input.attempt,
+            });
+          }
+          return;
         }
-        return;
+        await this.#recordTransientUnavailable(input, transient, now);
+        trigger = "availability-failover";
       }
-      await this.#recordFreeRouteUnavailable(input, rejection, now);
-      trigger = "route-reject-failover";
     } else {
       await this.#recordRateLimit(input, classification, now);
     }
@@ -635,17 +671,17 @@ export class FreeFirstEngine {
       now - dispatched.at <= COMPACTION_RETRY_WINDOW_MS;
     if (fixedModel) {
       this.#compactionRetriesSuppressed += 1;
-      this.#log(
-        "info",
+      const cause =
         trigger === "failover"
-          ? "compaction request is not retried on a just-limited free model"
-          : "compaction request is not retried on a free route that just rejected it",
-        {
-          sessionID: input.sessionID,
-          model: modelRefKey(input.model),
-          dispatchKind: dispatched?.kind,
-        },
-      );
+          ? "a just-limited free model"
+          : trigger === "route-reject-failover"
+            ? "a free route that just rejected it"
+            : "a transiently unavailable free model";
+      this.#log("info", `compaction request is not retried on ${cause}`, {
+        sessionID: input.sessionID,
+        model: modelRefKey(input.model),
+        dispatchKind: dispatched?.kind,
+      });
     }
 
     if (state.optOut !== undefined) {
@@ -827,6 +863,70 @@ export class FreeFirstEngine {
     });
   }
 
+  /**
+   * Record a transient free-route availability failure: the free route cannot
+   * currently serve an otherwise valid request (provider/server 5xx, OpenCode's
+   * structured `provider.internal`, a qualifying transport or timeout failure).
+   *
+   * The existing shared cooldown is armed with `reason: transient-availability`
+   * for the first rung of the bounded ladder, so every session and instance
+   * routes from it, the failed turn continues on the configured fallback, and
+   * the existing recovery path then tests the free route again. The bookkeeping
+   * stays separate from a rate limit: the transient ladder advances, the
+   * rate-limit ladder, its reset source, and `lastRateLimit*` are untouched, so
+   * a provider 500 can never be presented as a quota event.
+   *
+   * A second signal inside `duplicateLimitWindowMs` while a cooldown from the
+   * same outage is still running is a duplicate: it does not advance the ladder
+   * again, so a herd of sessions observing one provider incident cannot turn
+   * the ladder into a schedule the provider never gave.
+   */
+  async #recordTransientUnavailable(
+    input: RetryInput,
+    transient: TransientClassification,
+    now: number,
+  ): Promise<void> {
+    await this.#adoptPersistedCooldown();
+    const last = this.#health.lastTransientAt;
+    const duplicate =
+      last !== undefined && now - last < this.#config.duplicateLimitWindowMs && this.#inCooldown();
+    if (duplicate) {
+      this.#log("info", "free route transient failure detected", {
+        sessionID: input.sessionID,
+        classification: transient.reason,
+        category: transient.category ?? "server",
+        type: input.error.type ?? "unknown",
+        status: input.error.status ?? 0,
+        attempt: input.attempt,
+        duplicate: true,
+        cooldown: formatDuration(remainingCooldown(this.#health, now)),
+      });
+      return;
+    }
+    const applied = applyTransientUnavailable(this.#health, {
+      now,
+      reason: `failover-${transient.reason}`,
+      options: this.#config,
+      random: this.#random,
+    });
+    this.#health = applied.health;
+    this.#markDirty();
+    this.#log("info", "free route transient failure detected", {
+      sessionID: input.sessionID,
+      classification: transient.reason,
+      category: transient.category ?? "server",
+      type: input.error.type ?? "unknown",
+      status: input.error.status ?? 0,
+      attempt: input.attempt,
+      cooldown: formatDuration(applied.cooldownMs),
+      transientFailures: this.#health.transientFailures,
+    });
+    this.#log("info", "cooldown started", {
+      until: this.#health.cooldownUntil,
+      transientFailures: this.#health.transientFailures,
+    });
+  }
+
   /* -------------------------------------------------------------- controls */
 
   /**
@@ -921,6 +1021,15 @@ export class FreeFirstEngine {
       ...(this.#health.routeRejectedAt === undefined
         ? {}
         : { routeRejectedAt: this.#health.routeRejectedAt }),
+      ...(this.#health.transientFailures === undefined
+        ? {}
+        : { transientFailures: this.#health.transientFailures }),
+      ...(this.#health.lastTransientAt === undefined
+        ? {}
+        : { lastTransientAt: this.#health.lastTransientAt }),
+      ...(this.#health.lastTransientType === undefined
+        ? {}
+        : { lastTransientType: this.#health.lastTransientType }),
       ...(this.#probedAt === undefined ? {} : { probedAt: this.#probedAt }),
       ...(this.#health.probeBackoffUntil === undefined
         ? {}
@@ -958,6 +1067,9 @@ export class FreeFirstEngine {
     if (remaining > 0) {
       if (this.#health.cooldownReason === "free-route") {
         return `FREE unavailable: route rejected (retry in ${formatDuration(remaining)})`;
+      }
+      if (this.#health.cooldownReason === "transient-availability") {
+        return `FREE unavailable: transient provider failure (retry in ${formatDuration(remaining)})`;
       }
       return `FREE cooldown: ${formatDuration(remaining)}`;
     }
@@ -1363,6 +1475,7 @@ export class FreeFirstEngine {
       stored.lastHealthyAt !== undefined &&
       stored.lastHealthyAt > (this.#health.lastRateLimitAt ?? 0) &&
       stored.lastHealthyAt > (this.#health.routeRejectedAt ?? 0) &&
+      stored.lastHealthyAt > (this.#health.lastTransientAt ?? 0) &&
       this.#health.state !== "FREE_HEALTHY";
     if (recovered) {
       this.#health = markHealthy(this.#health, stored.lastHealthyAt);
@@ -1376,7 +1489,11 @@ export class FreeFirstEngine {
     // successful recovery.
     const ourRecoveryAt =
       this.#health.state === "FREE_HEALTHY" ? (this.#health.lastHealthyAt ?? 0) : 0;
-    const storedBlockAt = Math.max(stored.lastRateLimitAt ?? 0, stored.routeRejectedAt ?? 0);
+    const storedBlockAt = Math.max(
+      stored.lastRateLimitAt ?? 0,
+      stored.routeRejectedAt ?? 0,
+      stored.lastTransientAt ?? 0,
+    );
     if (ourRecoveryAt > storedBlockAt) return;
     // Probe bookkeeping is shared too: an instance that just backed the probe off
     // must not be probed again immediately by every other instance.
@@ -1423,6 +1540,25 @@ export class FreeFirstEngine {
         ? {}
         : { lastRateLimitType: stored.lastRateLimitType }),
       ...(stored.lastResetSource === undefined ? {} : { lastResetSource: stored.lastResetSource }),
+      // The transient ladder is shared too: the instance that continues after
+      // another one recorded an outage must keep escalating, not restart at the
+      // first rung.
+      ...(stored.transientFailures === undefined
+        ? {}
+        : {
+            transientFailures: Math.max(
+              this.#health.transientFailures ?? 0,
+              stored.transientFailures,
+            ),
+          }),
+      ...(stored.lastTransientAt === undefined
+        ? {}
+        : { lastTransientAt: Math.max(this.#health.lastTransientAt ?? 0, stored.lastTransientAt) }),
+      ...(stored.lastTransientAt !== undefined &&
+      stored.lastTransientAt >= (this.#health.lastTransientAt ?? 0) &&
+      stored.lastTransientType !== undefined
+        ? { lastTransientType: stored.lastTransientType }
+        : {}),
     };
     if (storedCooldown > now) {
       this.#log("info", "adopted a cooldown recorded by another free-first instance", {
@@ -1615,6 +1751,11 @@ export class FreeFirstEngine {
     if (this.#probe !== undefined) return; // one probe decides for everyone
     const waiting = this.#fallbackSessions();
     if (waiting.length === 0) {
+      // The boundary is behind us and no session is waiting on the fallback, so
+      // nothing else would ever clear the elapsed record — and an elapsed
+      // record keeps reporting FREE_PROBE while the scheduler keeps waking for
+      // a boundary that has passed. Drop it; this is not a claimed recovery.
+      this.#normaliseElapsedCooldown();
       this.#schedule();
       return;
     }
@@ -1631,9 +1772,10 @@ export class FreeFirstEngine {
       } finally {
         this.#probe = undefined;
       }
-      if (outcome === "limited") {
-        // A real limit: the fallback keeps owning the work until the new
-        // cooldown elapses. Nothing moves.
+      if (outcome === "limited" || outcome === "transient") {
+        // `limited`: a real rate limit. `transient`: the route is still unable
+        // to serve requests. Both keep the fallback owning the work until the
+        // re-armed cooldown elapses; nothing moves and no session thrashes.
         this.#schedule();
         return;
       }
@@ -1641,7 +1783,6 @@ export class FreeFirstEngine {
       // tells us the probe could not decide, so the next real model call is the
       // test — otherwise a probe that can never run would keep the free model
       // blocked forever, which is exactly the defect this guards against.
-      this.#normaliseElapsedCooldown();
       await this.#preemptParkedSessions();
       for (const sessionID of this.#fallbackSessions()) {
         await this.#upgrade(
@@ -1663,6 +1804,10 @@ export class FreeFirstEngine {
       for (const sessionID of this.#fallbackSessions()) {
         await this.#upgrade(sessionID, "passive-recovery");
       }
+    } else {
+      // Recovery is disabled on both paths, so the elapsed record has no
+      // outcome left to be normalised by; drop it so the scheduler stops.
+      this.#normaliseElapsedCooldown();
     }
     this.#schedule();
   }
@@ -1754,6 +1899,29 @@ export class FreeFirstEngine {
           level: this.#health.level,
         });
         return "limited";
+      }
+
+      if (outcome === "transient") {
+        // The probe mechanism works and the route does not: this is not a
+        // facility verdict but a real, current inability to serve the request.
+        // Re-arm the bounded transient backoff so the waiting sessions stay on
+        // the fallback, and try again when the longer window elapses.
+        const availability = classifyTransientAvailability(view);
+        const applied = applyTransientUnavailable(this.#health, {
+          now: at,
+          reason: `probe-${availability.reason}`,
+          options: this.#config,
+          random: this.#random,
+        });
+        this.#health = applied.health;
+        this.#markDirty();
+        this.#log("info", "recovery probe hit a transient availability failure", {
+          classification: availability.reason,
+          category: availability.category ?? "server",
+          cooldown: formatDuration(applied.cooldownMs),
+          transientFailures: this.#health.transientFailures,
+        });
+        return "transient";
       }
 
       // Not a limit: fail open and schedule the next attempt on the probe
