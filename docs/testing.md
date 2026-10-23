@@ -19,12 +19,15 @@ path, and concurrency behaviour are exercised deterministically.
 | `engine-route-rejected.test.mjs` | The free-route gate: classification boundary, shared episode, failover, recovery, restart |
 | `engine-recovery.test.mjs` | Probe-driven and passive recovery, still-limited and inconclusive probes, switch minimisation, prompt/prepare routing, manual overrides, park reclamation, restart semantics, dispose |
 | `engine-peak-policy.test.mjs` | `always-free-first`/`peak-only`/`off`, strict-PEAK gating, OFF_PEAK no-probe routing, PEAK/OFF_PEAK boundaries, weekend/holiday classifications, cross-instance and restart behaviour, active-turn PEAK→OFF routing, `context_length_exceeded` non-failover |
+| `engine-mode.test.mjs` | The persisted mode choice: precedence over configuration, restart/reload restoration, all six transitions, zero-probe OFF_PEAK switching, cooldown preservation, active-turn safety, compaction and manual-override interaction, cross-instance adoption, persistence failure, master-switch precedence |
+| `rpc.test.mjs` | Control-RPC semantics: aliases, `set-mode`/`clear-mode`, status, master switch, persistence-failure wording, and the explicit separation of `Free-first disabled` from `/offpeak off` |
+| `tui.test.mjs` | The CLI surface against a fake OpenCode TUI context: slash registration, selector contents/current mode, status formatting, mode changes, cancellation, and error handling |
 | `engine-compaction.test.mjs` | Cooldown routing, compaction retry decisions, request-kind handling |
 | `engine-cooldown-expiry.test.mjs` | Authoritative expiry, no re-block after inconclusive probes, cross-instance state, manual selection, transition churn |
 | `engine-reclamation.test.mjs` | Hold cancellation, committed races, resume guards, degraded interrupt path |
 | `engine-concurrency.test.mjs` | Simultaneous limits, probe herds, one probe per herd, duplicate observations, pruning, explicit-selection handling, driver failure safety |
 | `log.test.mjs` | Credential redaction, level gating, bounding |
-| `package.test.mjs` | Published entrypoints, no machine paths or credentials, no provider proxy or paid router, import graph containment |
+| `package.test.mjs` | Published entrypoints including `./tui`, no machine paths or credentials, no provider proxy or paid router, import graph containment |
 
 ### Fixtures
 
@@ -58,6 +61,12 @@ remains held by offpeak's cost protection until Free recovers, an OFF_PEAK
 compaction stays on Go, and a PEAK→OFF_PEAK waiting Go request releases exactly
 at the boundary. The default neighbour spec is `opencode-offpeak#v0.2.0`;
 override it with `FF_OFFPEAK_SPEC` when testing a branch.
+
+A second opt-in case, `mode-integration.test.mjs`, drives the control RPC over a
+real `opencode serve --standalone`-equivalent server: Peak Only off-peak sends
+zero Free requests, Free First uses Free, the switch back to Peak Only stops Free
+again, a genuine cooldown survives the switch, the saved mode survives a server
+restart, and Disabled leaves ordinary routing alone.
 
 Opt in with `FF_INTEGRATION=1` (the script sets it). These run the **real OpenCode
 CLI** and the **real `opencode-offpeak`** plugin against
@@ -97,6 +106,21 @@ Useful environment variables:
 | `FF_KEEP_HOME=1` | Keep the temporary home directory for inspection |
 | `FF_OPENCODE=/path/to/opencode` | Use a specific CLI binary |
 | `FF_OFFPEAK_SPEC=<spec>` | Install a different `opencode-offpeak` version |
+| `FF_TUI_SMOKE=1` | Enable the real-TUI suite (`npm run test:tui`) |
+
+## Real TUI — `npm run test:tui`
+
+`tui-smoke.test.mjs` starts the real OpenCode TUI in tmux, loads the packed
+package beside the real `opencode-offpeak` checkout, and drives the actual slash
+commands: `/free-first status`, the native selector, every mode change, the
+`/offpeak off` independence check, a full TUI/server restart that must preserve
+the saved mode, and the return to the configured mode. It spends no model
+tokens; every command is a local RPC/status operation. It is opt-in because it
+needs tmux and a real TUI:
+
+```sh
+npm run test:tui
+```
 
 ## Coexistence regression — `npm run test:offpeak-regression`
 

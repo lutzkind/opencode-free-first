@@ -78,6 +78,8 @@ export interface FreeFirstConfig {
   /**
    * When the free route may be used. Defaults to `always-free-first`, so an
    * existing installation keeps its behaviour until it opts into `peak-only`.
+   * An explicit mode saved from the TUI or the control RPC overrides this
+   * configured value; see ARCHITECTURE.md, "Mode control surface".
    */
   readonly freeUsageMode: FreeUsageMode;
 }

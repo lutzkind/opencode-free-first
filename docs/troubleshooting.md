@@ -256,6 +256,44 @@ rejected`, or `free route transient failure detected`. Check `cooldownReason` an
 the matching bookkeeping fields (`level` for limits, `transientFailures` for
 outages) to see which cause is currently in charge.
 
+## The TUI mode does not match what I expected
+
+`/free-first status` reports both the effective mode and where it came from:
+
+- `Mode: Peak Only (configured)` — no saved choice; `freeUsageMode` is in charge.
+- `Mode: Peak Only (saved in OpenCode)` — an explicit TUI/RPC choice is
+  overriding `freeUsageMode`.
+
+A saved choice wins over configuration by design. Change it with
+`/free-first mode free-first|peak-only|disabled`, or remove it with
+`/free-first mode configured` (RPC `clear-mode`). The master switch still wins:
+if `enabled` is `false`, or `/free-first off` was used, no mode routes until it
+is enabled again.
+
+## Free-first disabled is not /offpeak off
+
+`/free-first mode disabled` stops `opencode-free-first` from managing routing.
+`/offpeak off` belongs to `opencode-offpeak` and only affects its own automation
+and paid-price protection. Neither command changes the other plugin. If Free
+still looks delayed at peak pricing after disabling free-first, that is offpeak
+still doing its job; inspect it with `/offpeak status`, not `/free-first status`.
+
+## `/free-first` does nothing
+
+1. Confirm the release is `v0.3.0` or newer: the CLI companion is loaded from the
+   package's `./tui` export.
+2. Confirm the TUI logged no `Keymap.Provider is missing` or `plugin operation
+   failed` line.
+3. Run `/free-first status`: if it shows a state, the server plugin and RPC are
+   working and only the selector was cancelled or intercepted.
+4. In a fresh prompt, typing `/free-first` opens the host's slash completion
+   first. Press Enter once to accept the completion, then Enter again to run the
+   bare command. `/free-first status` and `/free-first mode …` run with one Enter.
+5. Headless or unaffected by the TUI? Use the RPC:
+   ```sh
+   opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"set-mode","mode":"peak-only"}}'
+   ```
+
 ## Two plugin instances, or a stale version
 
 ```sh
@@ -283,11 +321,20 @@ not live there.
   ```sh
   opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"reset"}}'
   ```
-- Pause routing entirely:
+- Switch the free-usage mode (persisted):
+  ```sh
+  opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"set-mode","mode":"peak-only"}}'
+  ```
+  Use `free-first`, `peak-only`, or `disabled` (`off` is also accepted).
+- Forget the saved mode and return to `freeUsageMode`:
+  ```sh
+  opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"clear-mode"}}'
+  ```
+- Pause routing entirely (runtime master switch, not a mode change):
   ```sh
   opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action":"off"}}'
   ```
-  Persisted cooldown state is preserved, and `on` resumes.
+  Persisted cooldown and mode state are preserved, and `on` resumes.
 - Permanently forget derived state by removing the
   `plugin:<id>:opencode-free-first/*` rows from OpenCode's plugin storage. This
   never touches sessions, prompts, credentials, or configuration.

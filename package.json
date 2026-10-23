@@ -1,7 +1,7 @@
 {
   "name": "opencode-free-first",
-  "version": "0.2.1",
-  "description": "OpenCode v2 plugin that prefers a free model and fails over and recovers around free-route availability problems (rate limits, the free-tier gate, and transient provider outages).",
+  "version": "0.3.0",
+  "description": "OpenCode v2 plugin that prefers a free model, fails over and recovers around free-route availability problems, and can be switched between Free First, Peak Only, and disabled inside the TUI.",
   "author": "Lutz Kind",
   "license": "MIT",
   "type": "module",
@@ -24,6 +24,11 @@
     "./core": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "bun": "./src/tui.ts",
+      "import": "./dist/tui.js"
     }
   },
   "types": "./dist/server.d.ts",
@@ -32,6 +37,7 @@
     "dist",
     "index.ts",
     "server.ts",
+    "tui.ts",
     "docs",
     "README.md",
     "AGENTS.md",
@@ -52,7 +58,8 @@
     "test": "npm run compile && node --test test/*.test.mjs",
     "check": "npm run lint && npm run typecheck && npm test",
     "test:integration": "npm run compile && FF_INTEGRATION=1 node --test test/integration.test.mjs",
-    "test:offpeak-regression": "node scripts/offpeak-regression.mjs"
+    "test:offpeak-regression": "node scripts/offpeak-regression.mjs",
+    "test:tui": "npm run compile && FF_TUI_SMOKE=1 node --test test/tui-smoke.test.mjs"
   },
   "keywords": [
     "opencode",
@@ -79,6 +86,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
     "@types/node": "24.12.2",
+    "solid-js": "^1.9.12",
     "typescript": "5.8.2"
   }
 }

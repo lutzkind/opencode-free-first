@@ -21,13 +21,16 @@ The governing rule:
 > Temporary free-route availability problems use the paid fallback. Permanent
 > request, account, configuration, or plugin failures stay visible.
 
-A second, opt-in rule controls *when* the free route may be spent:
+A second rule controls *when* the free route may be spent:
 
-> In `peak-only` mode, DeepSeek Free is used only while the configured paid
+> In **Peak Only** mode, DeepSeek Free is used only while the configured paid
 > fallback is in a verified PEAK pricing window. Off-peak, weekends, and Chinese
 > statutory holidays route straight to the paid fallback and never probe Free.
 
-Nothing here is a new provider stack, a proxy, a scheduler, or a queue. Real
+You can switch between **Free First**, **Peak Only**, and clearly labelled
+**Free-first disabled** inside the OpenCode TUI with `/free-first`, without
+editing JSON. Nothing here is a new provider stack, a proxy, a scheduler, or a
+queue. Real
 paid work keeps flowing through OpenCode's normal routing, so a cost/time policy
 plugin such as [`opencode-offpeak`](https://github.com/lutzkind/opencode-offpeak)
 stays in charge of *when* paid work runs.
@@ -39,6 +42,7 @@ stays in charge of *when* paid work runs.
 - [Install](#install)
 - [Configure](#configure)
 - [Free usage modes](#free-usage-modes)
+- [Switch modes inside OpenCode](#switch-modes-inside-opencode)
 - [Coexistence](#coexistence)
 - [How it decides](#how-it-decides)
 - [Cache behaviour](#cache-behaviour)
@@ -128,7 +132,7 @@ OpenCode v2 accepts npm-compatible package specifications, including Git URLs
 and exact tags. Install the published release:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.2.1
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.3.0
 opencode plugin list
 ```
 
@@ -179,13 +183,14 @@ default, and when to change it.
 ## Free usage modes
 
 `freeUsageMode` decides when the free route may be used. The default preserves
-the historical behaviour of every existing installation.
+the historical behaviour of every existing installation. The same three modes
+are available from the TUI, where they are named for humans:
 
-| Mode | Behaviour |
-| --- | --- |
-| `always-free-first` (default) | Prefer Free whenever it is healthy, at any hour. Existing installations keep this unless they opt in. |
-| `peak-only` | Use Free only when the canonical pricing owner positively reports **PEAK** for the configured fallback. `OFF_PEAK`, `FLAT`, `UNTRACKED`, and `UNKNOWN` all route to Go without a Free request or probe. Requires an explicit `fallback`. |
-| `off` | Free-first routing is disabled. OpenCode's normal configured routing applies; no failover, recovery, probe, or default-model rewrite. |
+| TUI label | `freeUsageMode` | Behaviour |
+| --- | --- | --- |
+| **Free First** | `always-free-first` (default) | Prefer Free whenever it is healthy, at any hour, PEAK or OFF_PEAK. Existing installations keep this unless they opt in. |
+| **Peak Only** | `peak-only` | Use Free only when the canonical pricing owner positively reports **PEAK** for the configured fallback. `OFF_PEAK`, `FLAT`, `UNTRACKED`, and `UNKNOWN` all route to Go without a Free request or probe. Requires an explicit `fallback`. |
+| **Free-first disabled** | `off` | Free-first routing is disabled. OpenCode's normal configured routing applies; no failover, recovery, probe, timer, or default-model rewrite. |
 
 ```jsonc
 {
@@ -211,6 +216,65 @@ behaviour is unchanged.
 The status line and RPC expose the policy, the canonical pricing state, the next
 pricing transition, and the active route (`FREE`, `GO`, `MIXED`, or `NONE`), so a
 cooldown or fallback is never mistaken for the normal off-peak route.
+
+## Switch modes inside OpenCode
+
+The plugin ships a native CLI (TUI) companion beside its server plugin. It is
+loaded automatically from the package's `./tui` export; no separate install or
+configuration is needed.
+
+```text
+/free-first                      open a native selector
+/free-first status               concise current state
+/free-first mode free-first      Free First (historical behaviour)
+/free-first mode peak-only       Peak Only (Free reserved for PEAK)
+/free-first mode disabled        Free-first disabled
+/free-first mode configured      forget the saved choice, use freeUsageMode
+```
+
+`/free-first` shows a small selector with **Free First**, **Peak Only**, and
+**Disable Free-first**, with the active mode marked. The selector and the slash
+commands are thin clients of the plugin's control RPC, so they behave the same
+in the TUI and in a headless request.
+
+### What the labels mean
+
+- **Free First** — use Free whenever it is healthy. This is the historical
+  behaviour and ignores pricing windows.
+- **Peak Only** — reserve Free for expensive pricing periods. Outside a verified
+  PEAK window, Go is used directly, with no Free request and no Free health
+  probe.
+- **Free-first disabled** — the plugin does not manage routing at all. OpenCode's
+  ordinary configured routing applies.
+
+`/offpeak off` is **not** Free-first disabled. `/offpeak` belongs to
+[`opencode-offpeak`](https://github.com/lutzkind/opencode-offpeak) and controls
+its paid peak-price protection/automation; it does not disable free-first
+routing, and disabling free-first does not change offpeak's settings.
+
+### Persistence and precedence
+
+A mode chosen from the TUI or the control RPC is saved in OpenCode's plugin
+storage under `opencode-free-first/mode-v1`. It survives new sessions, a plugin
+reload, an OpenCode restart, and a server restart. There is no database, daemon,
+scheduler, or second configuration service.
+
+One clear precedence applies:
+
+1. an explicit saved mode (TUI or `set-mode` RPC),
+2. the configured `freeUsageMode` (plugin options, then `free-first.json`),
+3. the historical default, `always-free-first`.
+
+`/free-first mode configured` (RPC `clear-mode`) removes the saved choice and
+returns to step 2. If the plugin's master switch is disabled (`enabled: false` or
+the `off` RPC action), a saved mode is still recorded but routing stays off; the
+master switch always wins.
+
+Mode changes take effect at the next safe routing boundary. A change that closes
+Free re-routes sessions that can already reach a step boundary without recalling
+an in-flight request; a change that opens Free lets the next prompt or request
+preparation move the session. No prompt is replayed, no tool call is duplicated,
+and a genuine Free cooldown is respected across the switch.
 
 ## Coexistence
 
@@ -366,7 +430,10 @@ opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action
 | `transientFailures` | consecutive transient outages (the transient ladder position) |
 | `lastTransientAt` / `lastTransientType` | when the last outage was seen, and its stable classification (`failover-http-500`, `failover-structured-provider-internal`, `failover-transport-econnreset`, `probe-http-503`, …) |
 | `primary` / `fallback` | the effective routes |
-| `freeUsageMode` | `always-free-first`, `peak-only`, or `off` |
+| `freeUsageMode` | the effective policy: `always-free-first`, `peak-only`, or `off` |
+| `configuredFreeUsageMode` | the value written in configuration, before any saved choice |
+| `freeUsageModeSource` | `override` when a saved choice is active, otherwise `config` |
+| `routingActive` | whether the master switch and the effective mode both allow routing |
 | `pricingState` / `pricingNextTransition` | canonical PEAK/OFF_PEAK classification and its next boundary (`peak-only`) |
 | `activeRoute` | what new traffic uses now: `FREE`, `GO`, `MIXED`, or `NONE` |
 | `cooldownMs` / `cooldownEndsAt` | remaining and absolute cooldown |
@@ -381,9 +448,11 @@ opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action
 | `manualOverrides` | sessions the user explicitly repointed |
 | `transitions` | the most recent model transitions, for switch-churn checks |
 
-Other actions: `reset` clears a cooldown an operator knows is lifted, `on` and
-`off` enable and disable routing. Core runtime behaviour never depends on the
-RPC.
+Other actions: `reset` clears a cooldown an operator knows is lifted; `on` and
+`off` are the runtime master switch (not a mode change); `set-mode` accepts
+`free-first`, `peak-only`, `disabled`, or the implementation aliases; and
+`clear-mode` removes the saved choice. Core runtime behaviour never depends on
+the RPC.
 
 State transitions are also logged with the `[opencode-free-first]` prefix: free
 selected, rate limit detected, free route rejected, transient failure detected
@@ -395,7 +464,8 @@ continuation prevented. Logs never contain prompts, response bodies, headers, or
 credentials.
 
 Sanitised persisted state lives in OpenCode's plugin storage under
-`opencode-free-first/health-v1` and `opencode-free-first/sessions-v1`.
+`opencode-free-first/health-v1`, `opencode-free-first/sessions-v1`, and (only
+after an explicit mode choice) `opencode-free-first/mode-v1`.
 
 ## Troubleshooting
 
@@ -434,6 +504,7 @@ state.
 npm install
 npm run check                # lint + typecheck + unit tests
 npm run test:integration     # real OpenCode CLI + real opencode-offpeak
+npm run test:tui             # real OpenCode TUI via tmux (opt-in)
 npm run test:offpeak-regression
 ```
 
@@ -456,7 +527,8 @@ See [`docs/development.md`](docs/development.md) and
 
 `opencode-offpeak` is optional for `always-free-first`/`off` and required for
 `peak-only` at runtime. Verified coexistence: `opencode-offpeak` `v0.2.0` beside
-`opencode-free-first` `v0.2.1` on OpenCode `2.0.30` and `2.1.3`.
+`opencode-free-first` `v0.3.0` on OpenCode `2.0.30` (server) and `2.1.3`
+(server + TUI).
 
 ## License
 

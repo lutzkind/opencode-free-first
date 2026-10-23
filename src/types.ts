@@ -134,8 +134,61 @@ export interface SessionDocument {
   readonly sessions: Record<string, SessionRecord>;
 }
 
+/**
+ * An explicit free-usage mode chosen from the TUI or the control RPC.
+ *
+ * It lives in OpenCode's plugin storage (the same mechanism as the health and
+ * session hints), not in the configuration file, so it survives a restart and
+ * is shared by every plugin instance without a second configuration service.
+ * Precedence is: persisted override > configured `freeUsageMode` > the
+ * historical default (`always-free-first`).
+ */
+export interface ModeOverrideRecord {
+  readonly schemaVersion: number;
+  readonly mode: FreeUsageMode;
+  readonly updatedAt: number;
+}
+
 /** Persisted shape version. Bump only with a migration. */
 export const HEALTH_SCHEMA_VERSION = 1;
 export const SESSION_SCHEMA_VERSION = 1;
+export const MODE_SCHEMA_VERSION = 1;
 export const HEALTH_STORAGE_KEY = "opencode-free-first/health-v1";
 export const SESSION_STORAGE_KEY = "opencode-free-first/sessions-v1";
+export const MODE_STORAGE_KEY = "opencode-free-first/mode-v1";
+
+/**
+ * User-facing names. `off` is deliberately never presented as just "Off":
+ * `/offpeak off` is a different control owned by the neighbouring plugin.
+ */
+export function freeUsageModeLabel(mode: FreeUsageMode): string {
+  switch (mode) {
+    case "always-free-first":
+      return "Free First";
+    case "peak-only":
+      return "Peak Only";
+    case "off":
+      return "Free-first disabled";
+  }
+}
+
+/**
+ * Accept the user-facing aliases as well as the implementation names. The TUI
+ * and the RPC both use this so `/free-first mode free-first` and
+ * `set-mode always-free-first` mean the same thing.
+ */
+export function parseFreeUsageMode(value: unknown): FreeUsageMode | undefined {
+  if (typeof value !== "string") return undefined;
+  switch (value.trim().toLowerCase()) {
+    case "free-first":
+    case "always-free-first":
+      return "always-free-first";
+    case "peak-only":
+      return "peak-only";
+    case "disabled":
+    case "off":
+      return "off";
+    default:
+      return undefined;
+  }
+}

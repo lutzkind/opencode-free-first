@@ -43,7 +43,7 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | Option | Default | Notes |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. `off` disables every routing decision, timer, and probe, and preserves persisted cooldown state. |
-| `freeUsageMode` | `"always-free-first"` | `always-free-first` preserves the historical behaviour. `peak-only` spends Free only in a verified PEAK window reported by `opencode-offpeak`; it requires an explicit `fallback` and routes off-peak/weekend/holiday traffic to Go with no Free request or probe. `off` disables free-first routing. Invalid values fail visibly. |
+| `freeUsageMode` | `"always-free-first"` | `always-free-first` (TUI: **Free First**) preserves the historical behaviour. `peak-only` (TUI: **Peak Only**) spends Free only in a verified PEAK window reported by `opencode-offpeak`; it requires an explicit `fallback` and routes off-peak/weekend/holiday traffic to Go with no Free request or probe. `off` (TUI: **Free-first disabled**) disables free-first routing. Invalid values fail visibly. |
 | `preferAsDefault` | `true` | Publish `primary` as OpenCode's default model selection, so new sessions start on the free model. |
 | `adoptFallbackSessions` | `false` | Also manage sessions whose model is the configured `fallback`, returning them to the free model when it is usable. Leave off unless you want free-first to move sessions you left on a paid route. |
 | `respectExplicitModelSelection` | `true` | Stop managing a session when you pick another model by hand. With `false`, a manual switch to the paid route keeps the session managed. |
@@ -65,6 +65,35 @@ so an uncertain pricing state cannot spend free quota.
 The mode is evaluated at prompt admission, request preparation, retry, recovery,
 and probe dispatch — the safe boundaries OpenCode already provides. No timer,
 scheduler, daemon, or second calendar is created.
+
+### Changing the mode without editing JSON
+
+Use the CLI plugin:
+
+```text
+/free-first
+/free-first status
+/free-first mode free-first
+/free-first mode peak-only
+/free-first mode disabled
+/free-first mode configured
+```
+
+`/free-first` opens a native selector. A chosen mode is persisted in OpenCode's
+plugin storage (`opencode-free-first/mode-v1`), so it survives a plugin reload,
+a restart, and a server restart. Precedence is:
+
+1. explicit saved choice (TUI or `set-mode` RPC),
+2. configured `freeUsageMode`,
+3. the historical default `always-free-first`.
+
+`/free-first mode configured` (RPC `clear-mode`) removes the saved choice. The
+master switch (`enabled: false` or the RPC `off` action) always wins over a saved
+mode.
+
+**`Free-first disabled` is not `/offpeak off`.** `opencode-offpeak` keeps its own
+paid-price protection and automation settings; `/offpeak off` does not change the
+free-first mode, and disabling free-first does not change offpeak.
 
 ## Timing
 

@@ -20,7 +20,10 @@ Compatibility: the package declares and tests OpenCode `>=2.0.26 <2.2.0`. The
 current production binary is 2.1.3. OpenCode 2.1's breaking session-schema change
 (`providerState` → `native`) does not touch the hooks used here; its new internal
 retry of buffered model calls only delays a refused recovery probe until the
-bounded retry schedule finishes. The real-CLI coexistence suite runs on 2.1.3.
+bounded retry schedule finishes. The real-CLI coexistence suite runs on 2.1.3, and the new CLI control surface is
+verified on the same binary through a real tmux-driven TUI test (native
+`keymap.layer`, `ui.dialog.select`, and `client.rpc`; no undocumented runtime
+behaviour).
 
 ## Responsibility boundary
 
@@ -69,7 +72,10 @@ prompt admission, request preparation, retry, recovery, and probe dispatch, so
 the first safe boundary after a PEAK/OFF_PEAK change applies the new route.
 `OFF_PEAK`, `FLAT`, `UNTRACKED`, `UNKNOWN`, a missing capability, and an RPC
 failure all mean **not eligible**; only a positive PEAK answer can spend free
-quota. `always-free-first` bypasses this gate; `off` disables the engine.
+quota. `always-free-first` bypasses this gate; `off` disables the engine. The
+effective mode is either the configured `freeUsageMode` or an explicit saved
+choice from the TUI/RPC; the precedence and transition rules are in
+[Mode control surface](#mode-control-surface).
 
 At OFF_PEAK an elapsed cooldown is cleared without a probe, recovery is not
 entered, and executing or newly admitted sessions represented on Free are routed
@@ -87,7 +93,8 @@ peak-only failover selects Go during PEAK, the paid request remains subject to
 | `src/log.ts` | Prefixed structured logging with credential redaction. |
 | `src/engine.ts` | Orchestration: session tracking, pricing-aware routing, failover, recovery, park reclamation, persistence, timers. |
 | `src/offpeak.ts` | Optional neighbour RPC ports: paid-hold cancellation and the canonical read-only `pricing` query. |
-| `src/rpc.ts` | Diagnostic RPC definition. |
+| `src/rpc.ts` | Portable control-RPC definition and the context-free control handler. |
+| `src/tui.ts` | The CLI (TUI) companion: native slash commands and a mode selector, implemented as a thin client of the control RPC. |
 | `src/server.ts` | Binds the engine to OpenCode's hooks, events, transforms, and RPC. |
 
 Everything with a side effect is injected into the engine (`Clock`, `StateStore`,
@@ -159,6 +166,20 @@ Cooldowns are **absolute epoch milliseconds**. A scheduled timer is a
 convenience: every observer re-derives the state from the timestamp, so a reload,
 a missed timer, or a restart cannot lose or duplicate a cooldown.
 
+### Free-usage mode (`opencode-free-first/mode-v1`)
+
+```json
+{ "schemaVersion": 1, "mode": "peak-only", "updatedAt": 1792078000000 }
+```
+
+Written only when the user chooses a mode from the TUI or the control RPC. It is
+not derived state: it is the explicit operator choice, and the effective mode
+precedence is **saved choice > configured `freeUsageMode` > `always-free-first`**.
+The document is deliberately separate from the health and session hints so a
+health write can never clobber a mode, and `clear-mode` removes it to fall back
+to configuration. The master `enabled` switch still wins: a saved mode is
+recorded but cannot route while the plugin is disabled.
+
 ### Session hints (`opencode-free-first/sessions-v1`)
 
 ```json
@@ -197,11 +218,46 @@ cannot move a session the user repointed while OpenCode was stopped.
 | `retry` | The failover decision: record the cooldown (`rate-limit`, `free-route`, or `transient-availability`), switch the model, force one cheap retry. Anything else stays visible. |
 | `generate` | Bound the recovery probe's output while it is in flight. |
 | `event.subscribe` | `session.execution.started|succeeded|failed|interrupted` and `session.model.selected`. |
-| `rpc.register` | Diagnostics and operator controls, including the current mode, pricing state, next transition, and active route. |
+| `rpc.register` | Diagnostics and operator controls, including the current mode, pricing state, next transition, and active route. Changing the mode also rebuilds this location's model defaults through `model.reload`, and emits the portable `transition` event so other locations adopt the same saved mode. |
+| CLI `keymap.layer` (`src/tui.ts`) | Native `/free-first`, `/free-first status`, and `/free-first mode …` slash commands, plus a native selector. It stores nothing; every read and write goes through the control RPC. |
 
 Each hook registration is disposed on unload, the event subscription is aborted,
 and the engine clears every timer on dispose, so a plugin reload cannot leave a
 duplicate handler or a duplicate timer behind.
+
+## Mode control surface
+
+The mode is part of the engine, not a second router. `setMode` changes the one
+`#mode` field that every routing decision already reads, persists the choice in
+`mode-v1`, and then applies it at the safe boundaries the engine already owns:
+
+```
+TUI /free-first … ──▶ control RPC ──▶ engine.setMode
+                                          │
+                                          ├── persist mode-v1
+                                          ├── refresh pricing (peak-only)
+                                          ├── rebuild model defaults (model.reload)
+                                          ├── re-route executing sessions that must use Go
+                                          └── arm/clear the existing scheduler
+```
+
+The TUI has no state of its own. It renders the RPC's status fields
+(`freeUsageMode`, `configuredFreeUsageMode`, `freeUsageModeSource`,
+`routingActive`, `pricingState`, `activeRoute`, health and the two models) and
+sends mode changes back through the same handler a headless caller uses.
+
+Transition safety follows from the existing boundaries:
+
+| Transition | Behaviour |
+| --- | --- |
+| Peak Only → Free First | The next prompt or request preparation moves a managed fallback session back to Free; the model default is rebuilt. An in-flight request is never recalled. |
+| Free First → Peak Only, OFF_PEAK | The pricing gate closes immediately, executing managed sessions on Free are moved to Go by the existing routing pass (trigger `mode-change`), and probes are suppressed. No request is recalled. |
+| Free First → Peak Only, PEAK | Free stays eligible; nothing moves. |
+| Any → Disabled | `#active()` becomes false, timers are cleared, and prompt/retry hooks stop managing. Persisted health is preserved untouched. |
+| Disabled → Free First / Peak Only | Routing resumes with the existing health record; a genuine cooldown is respected and no healthy state is manufactured. |
+
+A mode change is a push, not a guarantee: a session with no live model evidence
+is still left alone, and the next supported boundary applies the route.
 
 ## Failover
 
@@ -498,7 +554,7 @@ Every switch is recorded as `<timestamp> <trigger> -> provider/model`, where the
 trigger is one of `failover` (rate limit), `route-reject-failover` (free-route
 gate), `availability-failover` (transient outage), `prompt-admission`,
 `context-guard`, `off-peak-guard`, `passive-recovery`, `probe-recovery`,
-`park-preemption`, or `cooldown-guard`. The last 40 are
+`park-preemption`, `cooldown-guard`, or `mode-change`. The last 40 are
 exposed through `status().transitions`, which is what the switch-churn tests
 assert against: a complete free-limit cycle is exactly two transitions.
 

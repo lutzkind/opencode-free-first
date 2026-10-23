@@ -2,12 +2,16 @@
 
 ## Current public distribution
 
-`v0.2.1` is the canonical release and is installable from its exact GitHub tag
+`v0.3.0` is the canonical release and is installable from its exact GitHub tag
 with OpenCode CLI v2:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.2.1
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.3.0
 ```
+
+The release includes the server plugin and its native CLI (TUI) companion. The
+`./tui` export is loaded automatically by the TUI; a release is not complete
+until both entries load on the current production OpenCode version.
 
 OpenCode officially accepts npm-compatible Git package specifications, including
 GitHub URLs and exact tags, and loads the plugin's `bun` entrypoint directly. npm
@@ -19,13 +23,16 @@ registry publication is required for this release to be installed or used.
 1. `npm run check` — lint, typecheck, unit tests.
 2. `npm run test:integration` — real CLI plus the real `opencode-offpeak`.
 3. `npm run test:offpeak-regression` — the neighbour plugin's own checks.
-4. `npm pack --dry-run` — confirm the file list has no development or machine
-   files.
-5. Confirm `package.json` `version` matches the intended tag.
-6. Update `CHANGELOG.md` with the release date and a link to the tag.
-7. Commit, tag `vX.Y.Z`, push the branch and the tag.
-8. Create the GitHub release from the tag with the changelog entry as the body.
-9. Verify the exact-tag install in a scratch OpenCode home:
+4. `npm run test:tui` — real TUI on the current binary (tmux, opt-in).
+5. `npm pack --dry-run` — confirm the file list has no development or machine
+   files and includes `tui.ts` and `dist/tui.js`.
+6. Confirm `package.json` `version` matches the intended tag.
+7. Update `CHANGELOG.md` with the release date and a link to the tag.
+8. Commit, tag `vX.Y.Z`, push the branch and the tag.
+9. Create the GitHub release from the tag with the changelog entry as the body.
+10. Verify the exact-tag install in a scratch OpenCode home, including the TUI
+    entry (`/free-first status`), and check that the saved mode starts from the
+    configured `freeUsageMode`:
 
    ```sh
    XDG_CONFIG_HOME=/tmp/verify-config XDG_DATA_HOME=/tmp/verify-data \
@@ -35,13 +42,14 @@ registry publication is required for this release to be installed or used.
    XDG_CACHE_HOME=/tmp/verify-cache opencode plugin list
    ```
 
-10. Record the verification, including the loaded entrypoint path, in the release
-    notes or the project handoff.
+11. Record the verification, including the loaded entrypoint path and the TUI
+    version, in the release notes or the project handoff.
 
 ## Compatibility gate
 
 Each release states the OpenCode range it was verified against. `engines.opencode`
-is `>=2.0.26 <2.2.0` (verified on 2.0.27, 2.0.30, and 2.1.3) and
+is `>=2.0.26 <2.2.0` (server hooks verified on 2.0.27/2.0.30; server and TUI
+verified on 2.1.3) and
 `@opencode/plugin` is pinned to the exact tested version.
 Before widening the range, verify the plugin loads and the failover, recovery, and
 park-reclamation paths still behave in the new host, and update

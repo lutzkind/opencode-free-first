@@ -29,7 +29,14 @@ describe("package shape", () => {
       false,
       "opencode-offpeak must never be a package dependency",
     );
-    for (const file of ["src/server.ts", "src/engine.ts", "src/offpeak.ts", "src/config.ts"]) {
+    for (const file of [
+      "src/server.ts",
+      "src/engine.ts",
+      "src/offpeak.ts",
+      "src/config.ts",
+      "src/rpc.ts",
+      "src/tui.ts",
+    ]) {
       const text = readFileSync(path.join(root, file), "utf8");
       assert.equal(
         /from\s+["'][^"']*opencode-offpeak/.test(text),
@@ -49,9 +56,25 @@ describe("package shape", () => {
     assert.equal(pkg.exports["."].bun, "./src/server.ts");
     assert.equal(pkg.exports["."].import, "./dist/server.js");
     assert.equal(pkg.exports["./server"].bun, "./src/server.ts");
-    // A directory install resolves `<dir>/server` and `<dir>/index`.
+    // The CLI plugin is loaded automatically from the sibling `./tui` export.
+    assert.equal(pkg.exports["./tui"].bun, "./src/tui.ts");
+    assert.equal(pkg.exports["./tui"].import, "./dist/tui.js");
+    assert.equal(pkg.exports["./tui"].types, "./dist/tui.d.ts");
+    // A directory install resolves `<dir>/server`, `<dir>/index`, and `<dir>/tui`.
     assert.ok(existsSync(path.join(root, "server.ts")));
     assert.ok(existsSync(path.join(root, "index.ts")));
+    assert.ok(existsSync(path.join(root, "tui.ts")));
+    assert.ok(pkg.files.includes("tui.ts"));
+  });
+
+  it("ships the CLI entrypoint and does not import the server runtime into it", async () => {
+    const tui = (await import("../dist/tui.js")).default;
+    assert.equal(tui.id, "opencode-free-first");
+    assert.equal(typeof tui.setup, "function");
+    const source = readFileSync(path.join(root, "src/tui.ts"), "utf8");
+    assert.match(source, /import \{ Plugin \} from "@opencode\/plugin\/tui"/);
+    assert.doesNotMatch(source, /from "\.\/server\.js"/);
+    assert.doesNotMatch(source, /from "\.\/engine\.js"/);
   });
 
   /**
@@ -148,7 +171,7 @@ describe("package shape", () => {
       for (const specifier of specifiers) {
         assert.ok(
           specifier.startsWith("./") ||
-            specifier === "@opencode/plugin" ||
+            specifier.startsWith("@opencode/plugin") ||
             specifier.startsWith("node:"),
           `${file} imports ${specifier}`,
         );

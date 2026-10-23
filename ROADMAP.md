@@ -5,6 +5,13 @@ it, so each item needs evidence before it is implemented.
 
 ## Recently closed
 
+- **In-TUI mode control (v0.3.0).** Closed with a native CLI companion
+  (`./tui`): `/free-first`, `/free-first status`, `/free-first mode
+  free-first|peak-only|disabled`, and a native selector. The choice is persisted
+  in plugin storage with an explicit `saved choice > freeUsageMode > default`
+  precedence, `clear-mode` returns to configuration, and the labels keep
+  **Free-first disabled** distinct from `/offpeak off`.
+
 - **Peak-only free usage (v0.2.0).** Closed with `freeUsageMode` and a read-only
   `pricing` RPC from `opencode-offpeak`: Free is spent only in a verified PEAK
   window, off-peak/weekend/holiday traffic routes to Go with no Free request or
@@ -31,9 +38,10 @@ it, so each item needs evidence before it is implemented.
 - **Provider-reported scope.** Derive `cooldownScope` from evidence (for example a
   shared-quota header) instead of requiring an operator to choose, once a provider
   actually publishes that information.
-- **A TUI status line.** If OpenCode gains a stable status extension point, show
-  `FREE`, `FREE cooldown: 8m`, or `FALLBACK` there. Core behaviour must not depend
-  on it, and the RPC already exposes the same data.
+- **A TUI status line.** The mode control is already native; a persistent footer
+  indicator (`FREE`, `FREE cooldown: 8m`, `GO`) is still a candidate. Core
+  behaviour must not depend on it, and `/free-first status` already exposes the
+  same data.
 - **Richer reset heuristics.** Additional reset header names and payload shapes, as
   fixtures, when a provider is observed to use them.
 - **Session-scoped persistence pruning.** Drop persisted session hints when the
