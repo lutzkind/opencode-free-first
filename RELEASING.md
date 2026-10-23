@@ -2,11 +2,11 @@
 
 ## Current public distribution
 
-`v0.2.0` is the canonical release and is installable from its exact GitHub tag
+`v0.2.1` is the canonical release and is installable from its exact GitHub tag
 with OpenCode CLI v2:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.2.0
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.2.1
 ```
 
 OpenCode officially accepts npm-compatible Git package specifications, including

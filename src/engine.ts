@@ -1140,14 +1140,14 @@ export class FreeFirstEngine {
     const activeRoute: EngineStatus["activeRoute"] =
       !this.#enabled || this.#config.freeUsageMode === "off"
         ? "NONE"
-        : primarySessions > 0 && fallbackSessionIds.length > 0
-          ? "MIXED"
-          : fallbackSessionIds.length > 0
-            ? "GO"
-            : primarySessions > 0
-              ? "FREE"
-              : this.#pricingBlocksFree() && this.#config.fallback !== undefined
-                ? "GO"
+        : this.#pricingBlocksFree() && this.#config.fallback !== undefined
+          ? "GO"
+          : primarySessions > 0 && fallbackSessionIds.length > 0
+            ? "MIXED"
+            : fallbackSessionIds.length > 0
+              ? "GO"
+              : primarySessions > 0
+                ? "FREE"
                 : "FREE";
     const nextProbeAt = this.#nextProbeAt();
     return {
