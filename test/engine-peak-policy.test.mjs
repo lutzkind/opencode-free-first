@@ -154,6 +154,21 @@ describe("peak-only", () => {
     );
   });
 
+  it("reports GO as the active route off-peak even while idle sessions still hold a free hint", async () => {
+    const pricing = new FakePricing("PEAK");
+    const { engine } = await boot({ pricing });
+    await engine.refreshPricing(true);
+    engine.onModelRequest("ses_idle", FREE, "primary");
+    assert.equal(engine.status().activeRoute, "FREE");
+    pricing.set("OFF_PEAK");
+    await engine.refreshPricing(true);
+    // The idle session is not switched until it reaches a safe boundary, but
+    // new traffic cannot use Free: the active route is GO, not MIXED.
+    assert.equal(engine.status().activeRoute, "GO");
+    assert.equal(engine.status().managedSessions, 1);
+    assert.equal(engine.status().fallbackSessions, 0);
+  });
+
   it("never probes a cooldown that elapses during OFF_PEAK", async () => {
     const pricing = new FakePricing("PEAK");
     const { engine, clock, generate } = await boot({ pricing });

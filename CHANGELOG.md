@@ -1,4 +1,14 @@
-## [0.2.0] — 2026-10-23
+## [0.2.0] — ## [0.2.1] — 2026-10-23
+
+### Fixed
+
+- **`activeRoute` is now `GO` at OFF_PEAK even when idle sessions still carry a
+  persisted Free hint.** The field describes what new traffic may use under the
+  current policy, not the historical distribution of old sessions. The status
+  line was already correct; the structured field now agrees with it. No routing
+  behaviour changed.
+
+2026-10-23
 
 ### Added
 
