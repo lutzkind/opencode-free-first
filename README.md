@@ -455,7 +455,7 @@ See [`docs/development.md`](docs/development.md) and
 | `@opencode/plugin` | `2.0.26` |
 
 `opencode-offpeak` is optional for `always-free-first`/`off` and required for
-`peak-only` at runtime. Verified coexistence: `opencode-offpeak` `v0.2.1` beside
+`peak-only` at runtime. Verified coexistence: `opencode-offpeak` `v0.2.0` beside
 `opencode-free-first` `v0.2.1` on OpenCode `2.0.30` and `2.1.3`.
 
 ## License
