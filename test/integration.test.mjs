@@ -23,7 +23,7 @@ const ENABLED = process.env.FF_INTEGRATION === "1";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
 const OFFPEAK_SPEC =
-  process.env.FF_OFFPEAK_SPEC ?? "git+https://github.com/lutzkind/opencode-offpeak.git#v0.1.8";
+  process.env.FF_OFFPEAK_SPEC ?? "git+https://github.com/lutzkind/opencode-offpeak.git#v0.2.0";
 
 function opencodeBinary() {
   if (process.env.FF_OPENCODE) return process.env.FF_OPENCODE;
@@ -324,6 +324,185 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     assert.doesNotMatch(result.stdout, /free rate limit detected/);
   });
 
+  function writePeakOnlyConfig(extra = {}) {
+    writeConfig([
+      OFFPEAK_SPEC,
+      { package: repo, options: { ...freeFirstOptions, freeUsageMode: "peak-only", ...extra } },
+    ]);
+  }
+
+  /** The paid route is peak-priced for the whole test window; free stays flat. */
+  function peakPolicy() {
+    return {
+      id: "ffmock-paid-peak",
+      providers: ["ffmock"],
+      models: ["ff-paid"],
+      flatModels: ["ff-free"],
+      timeZone: "UTC",
+      blocked: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "23:59" }],
+      multiplier: 2,
+      source: "integration test",
+    };
+  }
+
+  it("Case 17 — peak-only OFF_PEAK selects Go and makes zero free requests", async () => {
+    writePeakOnlyConfig();
+    offpeakConfig(flatPolicy());
+    reset();
+    await control({ log: [], free: { mode: "ok" }, paid: { mode: "ok" } });
+
+    const result = await run("Reply with the word READY");
+    assertOk(result);
+    assert.match(result.stdout, /MOCK_OK model=ff-paid/);
+
+    const state = await mockState();
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "free").length,
+      0,
+      "OFF_PEAK made no free-model request",
+    );
+    assert.ok(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "paid").length >= 1,
+      "the paid route served the turn",
+    );
+    assert.doesNotMatch(result.stdout, /recovery probe started/);
+    assert.match(result.stdout, /Pricing: OFF_PEAK|Active route: GO/);
+    writeConfig(coexistencePlugins);
+  });
+
+  it("Case 18 — peak-only PEAK uses healthy Free and offpeak does not block it", async () => {
+    writePeakOnlyConfig();
+    offpeakConfig(peakPolicy());
+    reset();
+    await control({ log: [], free: { mode: "ok" }, paid: { mode: "ok" } });
+
+    const result = await run("Reply with the word READY");
+    assertOk(result);
+    assert.match(result.stdout, /MOCK_OK model=ff-free/);
+
+    const state = await mockState();
+    assert.ok(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "free").length >= 1,
+      "the free route served the turn",
+    );
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "paid").length,
+      0,
+      "offpeak did not divert or block the free route",
+    );
+    assert.match(result.stdout, /Pricing: PEAK|Active route: FREE/);
+    writeConfig(coexistencePlugins);
+  });
+
+  it("Case 19 — peak-only PEAK failover to Go keeps offpeak's cost protection", async () => {
+    writePeakOnlyConfig();
+    offpeakConfig(peakPolicy());
+    reset();
+    await control({
+      log: [],
+      free: { mode: "429", retryAfterSeconds: 1, failFirst: 3 },
+      paid: { mode: "ok" },
+    });
+
+    const result = await run("Reply with the word READY");
+    assertOk(result);
+    assert.match(result.stdout, /MOCK_OK model=ff-free/);
+    assert.match(result.stdout, /fallback selected/);
+    assert.match(result.stdout, /parked fallback request detected/);
+    assert.match(result.stdout, /stale fallback continuation neutralized/);
+    const state = await mockState();
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "paid").length,
+      0,
+      "no paid request was spent during PEAK",
+    );
+    writeConfig(coexistencePlugins);
+    offpeakConfig(undefined);
+  });
+
+  it("Case 21 — peak-only PEAK→OFF_PEAK releases a waiting Go request at the boundary", async () => {
+    writePeakOnlyConfig();
+    const now = new Date();
+    const start = new Date(now.getTime() - 60_000);
+    const end = new Date(now.getTime() + 60_000);
+    const boundary = new Date(end);
+    boundary.setUTCSeconds(0, 0);
+    const hhmm = (date) =>
+      `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
+    offpeakConfig({
+      id: "ffmock-paid-peak",
+      providers: ["ffmock"],
+      models: ["ff-paid"],
+      flatModels: ["ff-free"],
+      timeZone: "UTC",
+      blocked: [{ days: [0, 1, 2, 3, 4, 5, 6], start: hhmm(start), end: hhmm(end) }],
+      multiplier: 2,
+      source: "integration test",
+    });
+    reset();
+    await control({
+      log: [],
+      free: { mode: "429", retryAfterSeconds: 300, failFirst: 100 },
+      paid: { mode: "ok" },
+    });
+
+    const project = path.join(home, "project");
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        title: "boundary",
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: project },
+      });
+      const sessionID = created?.data?.id ?? created?.id;
+      assert.ok(sessionID, `no session id: ${JSON.stringify(created)}`);
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with the word READY",
+      });
+
+      let beforeBoundary = 0;
+      let messages = [];
+      for (let attempt = 0; attempt < 150; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        const state = await mockState();
+        if (Date.now() < boundary.getTime()) {
+          beforeBoundary = Math.max(
+            beforeBoundary,
+            state.log.filter((entry) => entry.event === "request" && entry.role === "paid").length,
+          );
+        }
+        const context = await call("GET", `/api/session/${sessionID}/context`);
+        messages = context?.data ?? [];
+        if (
+          messages.some((message) =>
+            (message.content ?? []).some((part) =>
+              String(part.text ?? "").includes("MOCK_OK model=ff-paid"),
+            ),
+          )
+        ) {
+          break;
+        }
+      }
+      const session = (await call("GET", `/api/session/${sessionID}`))?.data;
+      return { sessionID, messages, session, beforeBoundary };
+    });
+
+    assert.equal(outcome.beforeBoundary, 0, "no paid request was spent during PEAK");
+    const text = outcome.messages
+      .flatMap((message) => message.content ?? [])
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join(" ");
+    assert.match(text, /MOCK_OK model=ff-paid/);
+    assert.equal(
+      outcome.messages.filter((message) => message.type === "user").length,
+      1,
+      "no duplicate prompt across the boundary",
+    );
+    assert.equal(outcome.session?.model?.id, "ff-paid");
+    writeConfig(coexistencePlugins);
+    offpeakConfig(undefined);
+  });
+
   it("Case 2 — a free-model 429 fails over in the same session with no duplicated prompt", async () => {
     offpeakConfig(undefined);
     reset();
@@ -590,8 +769,13 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
           break;
         }
       }
-      // Give the engine a moment to run the fail-open recovery.
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      // OpenCode 2.1 retries buffered model calls internally, so the refused
+      // probe can take up to ~90 seconds to settle. Wait for the fail-open
+      // recovery log rather than assuming 2.0's immediate failure.
+      for (let attempt = 0; attempt < 240; attempt += 1) {
+        if (/recovery probe (?:is not permitted|inconclusive)/.test(output())) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
       const firstAfter = (await call("GET", `/api/session/${first.sessionID}`))?.data;
       const second = await start("after-recovery");
       return { first, firstAfter, second, probeRefused, log: output() };
@@ -1222,6 +1406,50 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       "the session stays on the fallback while the cooldown lasts",
     );
     assert.match(second.stdout, /MOCK_OK model=ff-paid/);
+    offpeakConfig(undefined);
+  });
+
+  it("Case 20 — peak-only OFF_PEAK compaction stays on Go with zero free requests", async () => {
+    writePeakOnlyConfig();
+    offpeakConfig(flatPolicy());
+    reset();
+    await control({
+      log: [],
+      free: { mode: "500", failFirst: null, promptTokens: 190_000 },
+      paid: { mode: "ok", promptTokens: 190_000 },
+    });
+
+    const first = await run("Reply with the word READY");
+    assertOk(first);
+    assert.match(first.stdout, /MOCK_OK model=ff-paid/);
+    const record = transcript();
+    const sessionID = record.session?.id;
+    assert.ok(sessionID, "the first turn created a session");
+
+    await control({
+      log: [],
+      free: { mode: "500", failFirst: null, promptTokens: 190_000 },
+      paid: { mode: "ok", promptTokens: 190_000 },
+    });
+    const second = await run("Continue", ["--session", sessionID]);
+    assertOk(second);
+    assert.match(second.stdout, /MOCK_OK model=ff-paid/);
+
+    const state = await mockState();
+    assert.equal(compactionRequests(state, "paid").length, 1, "Go served the compaction");
+    assert.equal(compactionRequests(state, "free").length, 0, "no free compaction");
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "free").length,
+      0,
+      "OFF_PEAK made no free request at all",
+    );
+    assert.equal(
+      compactions(transcript()).filter((message) => message.data.status === "completed").length,
+      1,
+      "exactly one completed compaction",
+    );
+    assert.equal(transcript().model.id, "ff-paid");
+    writeConfig(coexistencePlugins);
     offpeakConfig(undefined);
   });
 

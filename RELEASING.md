@@ -2,11 +2,11 @@
 
 ## Current public distribution
 
-`v0.1.0` is the canonical release and is installable from its exact GitHub tag
+`v0.2.0` is the canonical release and is installable from its exact GitHub tag
 with OpenCode CLI v2:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.0
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.2.0
 ```
 
 OpenCode officially accepts npm-compatible Git package specifications, including
@@ -41,7 +41,8 @@ registry publication is required for this release to be installed or used.
 ## Compatibility gate
 
 Each release states the OpenCode range it was verified against. `engines.opencode`
-is `>=2.0.26 <2.1.0` and `@opencode/plugin` is pinned to the exact tested version.
+is `>=2.0.26 <2.2.0` (verified on 2.0.27, 2.0.30, and 2.1.3) and
+`@opencode/plugin` is pinned to the exact tested version.
 Before widening the range, verify the plugin loads and the failover, recovery, and
 park-reclamation paths still behave in the new host, and update
 `docs/testing.md`.

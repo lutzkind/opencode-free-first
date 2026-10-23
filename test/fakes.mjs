@@ -193,6 +193,42 @@ export class FakePaidHolds {
   }
 }
 
+/** Canonical pricing classifier double used by peak-only tests. */
+export class FakePricing {
+  calls = [];
+  state = "PEAK";
+  nextTransition;
+  error;
+  #capability = "available";
+
+  constructor(state = "PEAK") {
+    this.state = state;
+  }
+
+  set(state, nextTransition) {
+    this.state = state;
+    this.nextTransition = nextTransition;
+  }
+
+  async evaluate(input) {
+    this.calls.push({ ...input });
+    if (this.error !== undefined) {
+      this.#capability = "unavailable";
+      throw this.error;
+    }
+    return {
+      state: this.state,
+      allowed: this.state === "PEAK",
+      policyID: "fake-policy",
+      ...(this.nextTransition === undefined ? {} : { nextTransition: this.nextTransition }),
+    };
+  }
+
+  capability() {
+    return this.#capability;
+  }
+}
+
 /** Transient generation port used for recovery probes. */
 export class FakeGenerate {
   calls = [];
@@ -305,6 +341,7 @@ export function engineOptions(overrides) {
       logger: log.logger,
       random: () => 0.5,
       ...(overrides.paidHolds ? { paidHolds: overrides.paidHolds } : {}),
+      ...(overrides.pricing ? { pricing: overrides.pricing } : {}),
       ...(overrides.onError ? { onError: overrides.onError } : {}),
       ...(overrides.onProbeState ? { onProbeState: overrides.onProbeState } : {}),
     },

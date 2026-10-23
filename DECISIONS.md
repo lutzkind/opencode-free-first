@@ -381,3 +381,50 @@ There is no evidence that warming the paid fallback's prompt cache pays for the
 tokens, so no synthetic paid request is ever made for cache reasons. Cache misses
 are accepted as a cost and latency concern, and the plugin minimises transitions
 instead.
+
+## 031 — `peak-only` consumes one canonical pricing answer; it never owns a calendar
+
+Free-usage timing is derived entirely from `opencode-offpeak`'s read-only
+`pricing` RPC for the configured fallback model. Copying the weekly windows or
+the Chinese holiday calendar into this plugin would create two authorities that
+drift. The mode only spends free quota on a positive `PEAK` answer; `OFF_PEAK`,
+`FLAT`, `UNTRACKED`, `UNKNOWN`, a missing neighbour, and an RPC failure are all
+closed. This is deliberately stricter than "not peak": an uncertain state must
+not consume free quota. The capability is optional infrastructure, exactly like
+`cancelHold`; no import, shared mutable state, or new service is introduced.
+
+## 032 — Pricing is refreshed at existing safe boundaries, not by a timer
+
+The cached answer expires at the earlier of the canonical `nextTransition` and a
+60-second freshness bound. Prompt admission, request preparation, retry,
+recovery, and probe dispatch refresh it, so the first supported boundary after a
+change applies the new route and no extra scheduler, daemon, or wake-up is
+created. An already-resolved in-flight request is allowed to finish because the
+supported API cannot recall it; the next attempt or step is routed.
+
+## 033 — A concurrent auxiliary 2xx is not a recovery proof
+
+OpenCode 2.1 issues title and other auxiliary requests concurrently with the main
+turn. A free title request that slipped through at a cooldown boundary returned
+2xx and cleared the cooldown while a recovery probe was still in flight, which
+masked the probe's refusal and could route a session back to Free prematurely.
+A 2xx now proves free health only when that request was dispatched while Free was
+eligible and no probe was in flight; the probe is the only verdict while it runs.
+
+## 034 — OpenCode 2.1 compatibility is an explicit, tested claim
+
+OpenCode 2.1 changed the session/compaction payload schema (`providerState` became
+`native`) but not the plugin hooks used here (`model.request`, `http.request`,
+`retry`, session events, RPC, model transforms). The only behavioural difference
+observed on the real 2.1.3 binary was internal retry of buffered model calls,
+which makes a refused recovery probe settle after the bounded retry schedule
+rather than immediately; the probe remains bounded and never blocks Free forever.
+The supported range is `>=2.0.26 <2.2.0`, declared in `engines.opencode`, and the
+real-CLI coexistence suite runs on 2.1.3.
+
+## 035 — The default mode cannot silently change an existing installation
+
+`freeUsageMode` defaults to `always-free-first`. `peak-only` requires an explicit
+fallback because the session-previous heuristic cannot be priced ahead of time.
+An invalid mode is a visible configuration error that disables routing rather
+than guessing. This preserves existing users' behaviour until they opt in.

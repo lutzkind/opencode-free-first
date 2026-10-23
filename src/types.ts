@@ -51,6 +51,27 @@ export type OptOutReason = "manual-model-change" | "disabled";
 
 export type LogLevel = "silent" | "error" | "info" | "debug";
 
+/**
+ * When the free route may be used.
+ *
+ * - `always-free-first` — the historical behaviour: prefer the free model
+ *   whenever it is healthy, regardless of the paid route's price window.
+ * - `peak-only` — spend free quota only while the configured paid fallback is
+ *   in a verified DeepSeek PEAK window. Off-peak, weekends, and Chinese public
+ *   holidays route straight to the paid fallback and never probe the free route.
+ * - `off` — free-first routing is disabled; OpenCode's normal configured
+ *   routing applies.
+ */
+export type FreeUsageMode = "always-free-first" | "peak-only" | "off";
+
+/**
+ * The canonical pricing classification owned by `opencode-offpeak`.
+ *
+ * `FLAT`, `UNTRACKED`, and `UNKNOWN` are deliberately distinct from `OFF_PEAK`:
+ * `peak-only` only spends free quota in a positively classified `PEAK` window.
+ */
+export type PricingState = "PEAK" | "OFF_PEAK" | "FLAT" | "UNTRACKED" | "UNKNOWN";
+
 export interface HealthRecord {
   readonly schemaVersion: number;
   readonly scope: string;

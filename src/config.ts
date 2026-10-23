@@ -14,7 +14,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { LogLevel, ModelRef } from "./types.js";
+import type { FreeUsageMode, LogLevel, ModelRef } from "./types.js";
 
 export interface FreeFirstConfig {
   readonly enabled: boolean;
@@ -75,6 +75,11 @@ export interface FreeFirstConfig {
   /** Upper bound on remembered sessions. Oldest entries are evicted. */
   readonly sessionLimit: number;
   readonly logLevel: LogLevel;
+  /**
+   * When the free route may be used. Defaults to `always-free-first`, so an
+   * existing installation keeps its behaviour until it opts into `peak-only`.
+   */
+  readonly freeUsageMode: FreeUsageMode;
 }
 
 export const DEFAULT_PRIMARY: ModelRef = {
@@ -112,6 +117,7 @@ export const DEFAULT_CONFIG: FreeFirstConfig = {
   cooldownScope: "shared",
   sessionLimit: 200,
   logLevel: "info",
+  freeUsageMode: "always-free-first",
 };
 
 export interface ResolvedConfig {
@@ -315,6 +321,20 @@ function buildConfig(raw: Record<string, unknown>): FreeFirstConfig {
       fail('logLevel must be one of "silent", "error", "info", "debug"');
     }
     config.logLevel = level;
+  }
+
+  if ("freeUsageMode" in raw) {
+    const mode = raw.freeUsageMode;
+    if (mode !== "always-free-first" && mode !== "peak-only" && mode !== "off") {
+      fail('freeUsageMode must be "always-free-first", "peak-only", or "off"');
+    }
+    config.freeUsageMode = mode;
+  }
+  // `peak-only` consumes the fallback's verified pricing classification, so a
+  // concrete paid route is required; the session-previous heuristic cannot be
+  // priced ahead of time.
+  if (config.freeUsageMode === "peak-only" && config.fallback === undefined) {
+    fail('freeUsageMode "peak-only" requires an explicit fallback model');
   }
 
   return config;

@@ -18,6 +18,7 @@ path, and concurrency behaviour are exercised deterministically.
 | `engine-transient.test.mjs` | The transient availability policy: 5xx / structured / transport failover, the must-not-fail-over matrix, bookkeeping separation, duplicate suppression, bounded escalation, probe re-arm, compaction suppression, persistence/adoption, scheduler hygiene |
 | `engine-route-rejected.test.mjs` | The free-route gate: classification boundary, shared episode, failover, recovery, restart |
 | `engine-recovery.test.mjs` | Probe-driven and passive recovery, still-limited and inconclusive probes, switch minimisation, prompt/prepare routing, manual overrides, park reclamation, restart semantics, dispose |
+| `engine-peak-policy.test.mjs` | `always-free-first`/`peak-only`/`off`, strict-PEAK gating, OFF_PEAK no-probe routing, PEAK/OFF_PEAK boundaries, weekend/holiday classifications, cross-instance and restart behaviour, active-turn PEAK→OFF routing, `context_length_exceeded` non-failover |
 | `engine-compaction.test.mjs` | Cooldown routing, compaction retry decisions, request-kind handling |
 | `engine-cooldown-expiry.test.mjs` | Authoritative expiry, no re-block after inconclusive probes, cross-instance state, manual selection, transition churn |
 | `engine-reclamation.test.mjs` | Hold cancellation, committed races, resume guards, degraded interrupt path |
@@ -48,6 +49,15 @@ without thrash; manual override respected in both directions; duplicate signals
 (of either cause) deduplicated; one probe per herd; and clean disposal.
 
 ## Integration tests — `npm run test:integration`
+
+The suite runs against the real installed OpenCode binary and both plugins. It
+requires OpenCode `>=2.0.26 <2.2.0`; the current release is verified on 2.1.3.
+It includes the original coexistence matrix plus `peak-only`: OFF_PEAK selects
+Go with zero Free requests, PEAK keeps healthy Free unblocked, a PEAK failover
+remains held by offpeak's cost protection until Free recovers, an OFF_PEAK
+compaction stays on Go, and a PEAK→OFF_PEAK waiting Go request releases exactly
+at the boundary. The default neighbour spec is `opencode-offpeak#v0.2.0`;
+override it with `FF_OFFPEAK_SPEC` when testing a branch.
 
 Opt in with `FF_INTEGRATION=1` (the script sets it). These run the **real OpenCode
 CLI** and the **real `opencode-offpeak`** plugin against

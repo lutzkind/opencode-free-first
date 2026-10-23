@@ -74,13 +74,25 @@ export {
 } from "./health.js";
 export type { Logger } from "./log.js";
 export { createLogger, scrub } from "./log.js";
+export type { CancelHoldResult, PaidHoldPort, PricingPort, PricingSnapshot } from "./offpeak.js";
+export {
+  createPaidHoldPort,
+  createPricingPort,
+  OFFPEAK_CANCEL_HOLD,
+  OFFPEAK_CANCEL_HOLD_RPC,
+  OFFPEAK_PRICING,
+  OFFPEAK_PRICING_RPC,
+  OFFPEAK_RPC_ID,
+} from "./offpeak.js";
 export type { FreeFirstRpcInput, FreeFirstRpcOutput } from "./rpc.js";
 export { FREE_FIRST_RPC, FREE_FIRST_RPC_ID, FREE_FIRST_USAGE, freeFirstEventType } from "./rpc.js";
 export type {
   CooldownReason,
   FreeState,
+  FreeUsageMode,
   HealthRecord,
   ModelRef,
+  PricingState,
   ResetSource,
   SessionRecord,
   SessionRoute,
