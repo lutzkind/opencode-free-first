@@ -84,23 +84,38 @@ export {
   OFFPEAK_PRICING_RPC,
   OFFPEAK_RPC_ID,
 } from "./offpeak.js";
-export type { FreeFirstRpcInput, FreeFirstRpcOutput } from "./rpc.js";
-export { FREE_FIRST_RPC, FREE_FIRST_RPC_ID, FREE_FIRST_USAGE, freeFirstEventType } from "./rpc.js";
+export type {
+  FreeFirstControlEngine,
+  FreeFirstRpcInput,
+  FreeFirstRpcOutput,
+} from "./rpc.js";
+export {
+  FREE_FIRST_RPC,
+  FREE_FIRST_RPC_ID,
+  FREE_FIRST_USAGE,
+  freeFirstEventType,
+  handleFreeFirstControl,
+} from "./rpc.js";
 export type {
   CooldownReason,
   FreeState,
   FreeUsageMode,
   HealthRecord,
   ModelRef,
+  ModeOverrideRecord,
   PricingState,
   ResetSource,
   SessionRecord,
   SessionRoute,
 } from "./types.js";
 export {
+  freeUsageModeLabel,
   HEALTH_SCHEMA_VERSION,
   HEALTH_STORAGE_KEY,
+  MODE_SCHEMA_VERSION,
+  MODE_STORAGE_KEY,
   modelRefKey,
+  parseFreeUsageMode,
   SESSION_SCHEMA_VERSION,
   SESSION_STORAGE_KEY,
   sameModel,

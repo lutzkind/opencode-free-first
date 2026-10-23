@@ -375,6 +375,51 @@ decides anything else, while keeping the ladder positions and the outage/limit
 history. Dropping the record here is explicitly *not* a claimed recovery:
 `lastHealthyAt` is not set.
 
+## 036 — A saved mode lives in plugin storage, not in the config file
+
+The TUI needs a mode choice that survives a restart without editing JSON. Live
+configuration editing is not part of OpenCode's plugin API, and rewriting the
+user's `opencode.json` (or `free-first.json`) from a plugin would be a second,
+surprising configuration authority. The mode therefore lives in the same plugin
+storage the plugin already uses for health and session hints, under
+`opencode-free-first/mode-v1`.
+
+Precedence is explicit and reversible:
+
+1. the saved mode (TUI or `set-mode` RPC),
+2. the configured `freeUsageMode`,
+3. the historical default `always-free-first`.
+
+`clear-mode` removes the saved document and returns to configuration. The master
+`enabled` switch always wins over either, so a saved mode can never override an
+operator's deliberate disable. There is no database, daemon, second service, or
+duplicate store.
+
+Evidence: unit tests for save/restore, override precedence, corrupt documents,
+persistence failure, clear-mode, restart, and cross-instance adoption; the real
+TUI test restarts OpenCode and observes the saved choice; the live mode-switch
+integration restarts the real server and observes the same choice.
+
+## 037 — The TUI is a thin client of the control RPC
+
+The CLI companion registers `/free-first` with the supported `keymap.layer`
+slash API and uses `ui.dialog.select` for the selector. It deliberately stores
+nothing: `status`, `set-mode`, and `clear-mode` all go through the server
+plugin's control RPC, which owns the engine and the persistent choice. This keeps
+one source of truth, makes the same commands work in the TUI and over HTTP, and
+avoids a second state machine in a UI layer.
+
+Mode changes rebuild model defaults with `model.reload` and emit the existing
+portable `transition` event so other locations can adopt the choice. The engine
+alone performs routing; the UI never calls `switchModel` or touches a session.
+The selector labels the third choice **Disable Free-first**, and every status
+message says **Free-first disabled**, because `/offpeak off` is a different
+control owned by the neighbouring plugin.
+
+Evidence: `test/tui.test.mjs` (deterministic fake TUI context) and
+`test/tui-smoke.test.mjs` (real OpenCode 2.1.3 TUI in tmux, including the
+`/offpeak off` independence check and a restart).
+
 ## 017 — No paid traffic to keep a cache warm
 
 There is no evidence that warming the paid fallback's prompt cache pays for the

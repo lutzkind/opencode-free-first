@@ -90,6 +90,11 @@ export class FakeStorage {
     this.#data.set(key, structuredClone(value));
   }
 
+  async remove(key) {
+    this.writes += 1;
+    this.#data.delete(key);
+  }
+
   plain() {
     return Object.fromEntries(this.#data);
   }
@@ -344,6 +349,7 @@ export function engineOptions(overrides) {
       ...(overrides.pricing ? { pricing: overrides.pricing } : {}),
       ...(overrides.onError ? { onError: overrides.onError } : {}),
       ...(overrides.onProbeState ? { onProbeState: overrides.onProbeState } : {}),
+      ...(overrides.onModeChanged ? { onModeChanged: overrides.onModeChanged } : {}),
     },
     clock,
     storage,

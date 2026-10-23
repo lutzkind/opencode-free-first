@@ -53,6 +53,7 @@ import type {
   FreeUsageMode,
   HealthRecord,
   ModelRef,
+  ModeOverrideRecord,
   PricingState,
   SessionRecord,
   SessionRoute,
@@ -60,6 +61,8 @@ import type {
 import {
   HEALTH_SCHEMA_VERSION,
   HEALTH_STORAGE_KEY,
+  MODE_SCHEMA_VERSION,
+  MODE_STORAGE_KEY,
   modelRefKey,
   SESSION_SCHEMA_VERSION,
   SESSION_STORAGE_KEY,
@@ -77,6 +80,7 @@ export interface Clock {
 export interface StateStore {
   get(key: string): Promise<unknown>;
   set(key: string, value: unknown): Promise<void>;
+  remove(key: string): Promise<void>;
 }
 
 export interface SessionDriver {
@@ -152,6 +156,12 @@ export interface EngineOptions {
   readonly onError?: (error: unknown) => void;
   /** Notified while an out-of-band recovery probe is in flight. */
   readonly onProbeState?: (active: boolean) => void;
+  /**
+   * Notified when the effective mode changes, including adoption from another
+   * instance. The server uses it to rebuild model defaults before the next
+   * step resolves its model.
+   */
+  readonly onModeChanged?: (mode: FreeUsageMode) => Promise<void> | void;
 }
 
 export interface EngineStatus {
@@ -160,8 +170,14 @@ export interface EngineStatus {
   readonly status: string;
   readonly primary: string;
   readonly fallback: string;
-  /** Configured free-usage policy. */
+  /** Effective free-usage policy, including a persisted TUI override. */
   readonly freeUsageMode: FreeUsageMode;
+  /** `freeUsageMode` as written in the configuration, before any override. */
+  readonly configuredFreeUsageMode: FreeUsageMode;
+  /** Whether the effective mode comes from the saved choice or the configuration. */
+  readonly freeUsageModeSource: "override" | "config";
+  /** True when the master switch and the effective mode both allow routing. */
+  readonly routingActive: boolean;
   /** Canonical pricing classification, present in `peak-only` mode. */
   readonly pricingState?: PricingState;
   readonly pricingNextTransition?: number;
@@ -261,8 +277,11 @@ export class FreeFirstEngine {
   readonly #random: () => number;
   readonly #onError: (error: unknown) => void;
   readonly #onProbeState: (active: boolean) => void;
+  readonly #onModeChanged: (mode: FreeUsageMode) => Promise<void> | void;
 
   #enabled: boolean;
+  #mode: FreeUsageMode;
+  #modeOverride: boolean;
   #health: HealthRecord;
   readonly #sessionsState = new Map<string, SessionState>();
   readonly #pendingSwitch = new Map<string, { readonly model: ModelRef; readonly at: number }>();
@@ -306,6 +325,8 @@ export class FreeFirstEngine {
   #pricingValidUntil = 0;
   #pricingRefresh: Promise<PricingSnapshot | undefined> | undefined;
   #defaultModel: ModelRef | undefined;
+  /** The default model this plugin last published through `model.transform`. */
+  #publishedDefault: ModelRef | undefined;
   #disposed = false;
   #dirty = false;
 
@@ -321,7 +342,10 @@ export class FreeFirstEngine {
     this.#random = options.random;
     this.#onError = options.onError ?? (() => {});
     this.#onProbeState = options.onProbeState ?? (() => {});
+    this.#onModeChanged = options.onModeChanged ?? (() => {});
     this.#enabled = options.config.enabled;
+    this.#mode = options.config.freeUsageMode;
+    this.#modeOverride = false;
     this.#health = initialHealth(modelRefKey(options.config.primary), this.#clock.now());
   }
 
@@ -330,10 +354,23 @@ export class FreeFirstEngine {
   /** Restore persisted derived state, then arm the recovery scheduler. */
   async start(): Promise<void> {
     const now = this.#clock.now();
-    const [rawHealth, rawSessions] = await Promise.all([
+    const [rawHealth, rawSessions, rawMode] = await Promise.all([
       this.#safeGet(HEALTH_STORAGE_KEY),
       this.#safeGet(SESSION_STORAGE_KEY),
+      this.#safeGet(MODE_STORAGE_KEY),
     ]);
+
+    const storedMode = this.#decodeMode(rawMode);
+    if (storedMode !== undefined) {
+      this.#mode = storedMode;
+      this.#modeOverride = true;
+      this.#log("info", "restored free usage mode from persisted state", {
+        mode: storedMode,
+        configuredMode: this.#config.freeUsageMode,
+      });
+    } else if (rawMode !== undefined) {
+      this.#log("info", "discarded incompatible persisted free usage mode; using configuration");
+    }
 
     const restored = decodeHealth(rawHealth, modelRefKey(this.#config.primary));
     if (restored !== undefined) {
@@ -410,13 +447,13 @@ export class FreeFirstEngine {
    * free model that is known to be cooling down.
    */
   async onPrompt(sessionID: string): Promise<void> {
+    if (this.#disposed) return;
+    // Adopt a mode or cooldown another instance saved before deciding whether
+    // this instance is active: disabling free-first in one location must also
+    // take effect at the next prompt in another location.
+    await this.#adoptPersistedState();
     if (!this.#active()) return;
     await this.refreshPricing();
-    // OpenCode loads one plugin instance per location and every instance shares
-    // this plugin's storage, so a cooldown another instance recorded must apply
-    // to this prompt. One keyed read per prompt is the price of a shared
-    // cooldown across a long-lived service.
-    await this.#adoptPersistedCooldown();
     if (this.#pricingBlocksFree()) {
       // Off-peak: the free route stays untouched. Expire an elapsed cooldown
       // without probing it, then make sure every managed session that could
@@ -447,7 +484,8 @@ export class FreeFirstEngine {
    */
   async #applyRouting(sessionID: string, state: SessionState, trigger: string): Promise<void> {
     if (state.optOut !== undefined) return;
-    await this.#adoptPersistedCooldown();
+    await this.#adoptPersistedState();
+    if (!this.#active()) return;
     if (this.#pricingBlocksFree()) {
       if (this.#isPrimary(state.model ?? this.#config.primary)) {
         await this.#downgrade(sessionID, trigger);
@@ -474,30 +512,36 @@ export class FreeFirstEngine {
    * request parked by another plugin's pre-model hold.
    */
   async onContext(sessionID: string, model: ModelRef): Promise<void> {
-    if (!this.#active()) return;
-    if (this.#config.freeUsageMode === "peak-only") await this.refreshPricing();
+    if (this.#disposed) return;
     const now = this.#clock.now();
+    // Record the prepared request before the first await, so a host that calls
+    // `model.request` immediately afterwards still sees an undispatched mark.
+    if (this.#isRelevant(model) && this.#enabled && this.#mode !== "off") {
+      this.#prepared.set(sessionID, { model, at: now, dispatched: false });
+      if (this.#logger.enabled("debug")) {
+        this.#log("debug", "request prepared", {
+          sessionID,
+          model: modelRefKey(model),
+          health: this.#health.state,
+        });
+      }
+      this.#schedule();
+    }
+    // Every request preparation refreshes the shared view — in both
+    // directions, because a preparation on the free model must not be sent
+    // while FREE is known to be unavailable, a preparation on the fallback is
+    // where recovery is decided, and a mode saved by another instance must
+    // apply before the next boundary resolves a model.
+    await this.#adoptPersistedState();
+    if (!this.#active()) {
+      this.#prepared.delete(sessionID);
+      return;
+    }
+    if (this.#mode === "peak-only") await this.refreshPricing();
     if (!this.#isRelevant(model)) {
       this.#prepared.delete(sessionID);
       return;
     }
-    this.#prepared.set(sessionID, { model, at: now, dispatched: false });
-    if (this.#logger.enabled("debug")) {
-      this.#log("debug", "request prepared", {
-        sessionID,
-        model: modelRefKey(model),
-        health: this.#health.state,
-      });
-    }
-    this.#schedule();
-
-    // Another instance may hold a cooldown this one has not seen yet. Every
-    // request preparation refreshes that view — in both directions, because a
-    // preparation on the free model must not be sent while FREE is known to be
-    // unavailable, and a preparation on the fallback is where recovery is
-    // decided. This is the read that makes a shared cooldown authoritative
-    // before the *next* step boundary resolves a model.
-    await this.#adoptPersistedCooldown();
 
     const state = await this.#stateWithModel(sessionID);
     if (this.#pricingBlocksFree()) {
@@ -570,7 +614,25 @@ export class FreeFirstEngine {
       // A request this plugin just asked the parking plugin to cancel is
       // obsolete work: it reached the boundary only to be refused, and it must
       // not be mistaken for the model the session is actually on.
-      if (!this.#pendingResumes.has(sessionID)) state.model = model;
+      if (!this.#pendingResumes.has(sessionID)) {
+        state.model = model;
+        // A real fallback dispatch also proves the session is represented on
+        // the paid route. Without this, a title request that dispatches before
+        // prompt admission can leave a new session recorded as unmanaged on
+        // PRIMARY, which would hide it from a later Peak Only -> Free First
+        // upgrade. An explicit user opt-out is still respected.
+        const publishedDefault =
+          this.#publishedDefault !== undefined && sameModel(model, this.#publishedDefault);
+        if (
+          state.optOut === undefined &&
+          (state.managed || this.#config.adoptFallbackSessions || publishedDefault)
+        ) {
+          state.managed = true;
+          state.route = "FALLBACK";
+          state.updatedAt = this.#clock.now();
+          this.#markDirty();
+        }
+      }
     }
     this.#schedule();
   }
@@ -618,6 +680,11 @@ export class FreeFirstEngine {
       now - pending.at <= this.#config.switchConfirmMs;
     if (pending !== undefined) this.#pendingSwitch.delete(event.sessionID);
 
+    const publishedDefault =
+      this.#publishedDefault !== undefined &&
+      sameModel(event.model, this.#publishedDefault) &&
+      (event.previous === undefined || sameModel(event.previous, this.#publishedDefault));
+
     if (this.#isPrimary(event.model)) {
       const returning = state.route === "FALLBACK" || state.optOut !== undefined;
       state.managed = true;
@@ -628,11 +695,18 @@ export class FreeFirstEngine {
         model: modelRefKey(event.model),
         pluginInitiated,
       });
-    } else if (this.#isFallback(event.model) && pluginInitiated) {
+    } else if (this.#isFallback(event.model) && (pluginInitiated || publishedDefault)) {
       state.managed = true;
       state.route = "FALLBACK";
+      state.optOut = undefined;
       if (this.#logger.enabled("debug")) {
-        this.#log("debug", "failover switch confirmed", { sessionID: event.sessionID });
+        this.#log(
+          "debug",
+          publishedDefault && !pluginInitiated
+            ? "session followed the published fallback default"
+            : "failover switch confirmed",
+          { sessionID: event.sessionID },
+        );
       }
     } else if (this.#isFallback(event.model) && !this.#config.respectExplicitModelSelection) {
       // The operator asked free-first to keep managing the session through a
@@ -685,6 +759,8 @@ export class FreeFirstEngine {
    * duplicated prompt or tool call.
    */
   async onRetry(input: RetryInput): Promise<void> {
+    if (this.#disposed) return;
+    await this.#adoptPersistedState();
     if (!this.#active()) return;
     await this.refreshPricing();
     if (this.#isFallback(input.model)) {
@@ -820,7 +896,8 @@ export class FreeFirstEngine {
     // Another free-first instance (OpenCode loads one per location) may already
     // have recorded this provider window. Adopting it keeps the ladder and the
     // cooldown shared instead of each location discovering the limit alone.
-    await this.#adoptPersistedCooldown();
+    await this.#adoptPersistedState();
+    if (!this.#active()) return;
     const reset = extractReset({
       now,
       headers: this.#lastHeaders.get(input.sessionID),
@@ -901,7 +978,8 @@ export class FreeFirstEngine {
     rejection: FreeRouteRejection,
     now: number,
   ): Promise<void> {
-    await this.#adoptPersistedCooldown();
+    await this.#adoptPersistedState();
+    if (!this.#active()) return;
     const duplicate =
       this.#health.state === "FREE_COOLDOWN" &&
       this.#health.cooldownReason === "free-route" &&
@@ -957,7 +1035,8 @@ export class FreeFirstEngine {
     transient: TransientClassification,
     now: number,
   ): Promise<void> {
-    await this.#adoptPersistedCooldown();
+    await this.#adoptPersistedState();
+    if (!this.#active()) return;
     const last = this.#health.lastTransientAt;
     const duplicate =
       last !== undefined && now - last < this.#config.duplicateLimitWindowMs && this.#inCooldown();
@@ -1004,9 +1083,10 @@ export class FreeFirstEngine {
    * Re-read shared health. Diagnostics and the RPC call this so a reported
    * state reflects the whole OpenCode instance, not one location's memory.
    */
-  async refresh(): Promise<void> {
-    await this.#adoptPersistedCooldown();
-    await this.#enforceCooldownRouting("cooldown-guard");
+  async refresh(trigger = "cooldown-guard"): Promise<void> {
+    await this.#adoptPersistedState();
+    if (this.#mode === "peak-only") await this.refreshPricing();
+    await this.#enforceCooldownRouting(trigger);
     this.#schedule();
   }
 
@@ -1019,7 +1099,7 @@ export class FreeFirstEngine {
    * stale classification for longer than a minute. No timer is created.
    */
   async refreshPricing(force = false): Promise<PricingSnapshot | undefined> {
-    if (this.#config.freeUsageMode !== "peak-only") return undefined;
+    if (this.#mode !== "peak-only") return undefined;
     const now = this.#clock.now();
     if (!force && this.#pricing !== undefined && now < this.#pricingValidUntil) {
       return this.#pricing;
@@ -1055,7 +1135,7 @@ export class FreeFirstEngine {
       );
       if (previous !== next.state) {
         this.#log("info", "free usage pricing changed", {
-          freeUsageMode: this.#config.freeUsageMode,
+          freeUsageMode: this.#mode,
           pricingState: next.state,
           nextTransition: next.nextTransition,
           policyID: next.policyID,
@@ -1078,7 +1158,7 @@ export class FreeFirstEngine {
    */
   defaultTarget(): ModelRef {
     if (
-      this.#config.freeUsageMode === "peak-only" &&
+      this.#mode === "peak-only" &&
       this.#pricingBlocksFree() &&
       this.#config.fallback !== undefined
     ) {
@@ -1109,6 +1189,138 @@ export class FreeFirstEngine {
     return this.#enabled;
   }
 
+  /** Effective free-usage policy, including a saved TUI/RPC choice. */
+  get mode(): FreeUsageMode {
+    return this.#mode;
+  }
+
+  /** The policy written in the configuration, before any saved choice. */
+  get configuredMode(): FreeUsageMode {
+    return this.#config.freeUsageMode;
+  }
+
+  get modeSource(): "override" | "config" {
+    return this.#modeOverride ? "override" : "config";
+  }
+
+  /**
+   * Change the effective free-usage policy from the TUI or the control RPC.
+   *
+   * The choice is persisted in OpenCode's plugin storage, so it survives a new
+   * session, a plugin reload, and a server restart. The change takes effect at
+   * the next safe routing boundary: a mode that closes Free re-routes the
+   * sessions that can already reach a step boundary (no request is recalled),
+   * while a mode that opens Free leaves recovery to prompt admission so no
+   * active call is interrupted or duplicated. Existing health evidence is
+   * never manufactured or discarded.
+   */
+  async setMode(mode: FreeUsageMode): Promise<{ persisted: boolean }> {
+    const previous = this.#mode;
+    this.#mode = mode;
+    this.#modeOverride = true;
+    const persisted = await this.#persistMode(mode);
+    // Resolve the canonical answer before rebuilding model defaults, so a
+    // transition into Peak Only never publishes Free on a stale PEAK answer.
+    if (mode === "peak-only") await this.refreshPricing(true);
+    await this.#notifyModeChanged(mode);
+    this.#log("info", "free usage mode changed", {
+      from: previous,
+      to: mode,
+      source: "saved",
+      persisted,
+    });
+    await this.refresh("mode-change");
+    return { persisted };
+  }
+
+  /**
+   * Forget the saved mode and fall back to the configured `freeUsageMode`.
+   * This is the escape hatch that keeps the documented precedence reversible.
+   */
+  async clearModeOverride(): Promise<{ persisted: boolean }> {
+    const previous = this.#mode;
+    let persisted = true;
+    try {
+      await this.#storage.remove(MODE_STORAGE_KEY);
+    } catch (error) {
+      persisted = false;
+      this.#onError(error);
+    }
+    if (persisted) {
+      this.#mode = this.#config.freeUsageMode;
+      this.#modeOverride = false;
+      if (this.#mode === "peak-only") await this.refreshPricing(true);
+      await this.#notifyModeChanged(this.#mode);
+    } else {
+      // The saved choice could not be removed, so it still owns the mode.
+      this.#mode = previous;
+      this.#modeOverride = true;
+    }
+    this.#log("info", "cleared the saved free usage mode", {
+      from: previous,
+      to: this.#mode,
+      persisted,
+    });
+    await this.refresh("mode-change");
+    return { persisted };
+  }
+
+  /**
+   * Adopt a mode another instance saved. Returns true when the effective mode
+   * changed, which lets the server reload model defaults for this location.
+   */
+  async syncMode(): Promise<boolean> {
+    const stored = await this.#readMode();
+    if (stored === undefined || stored === this.#mode) return false;
+    this.#log("info", "adopted free usage mode saved by another instance", {
+      from: this.#mode,
+      to: stored,
+    });
+    this.#mode = stored;
+    this.#modeOverride = true;
+    if (stored === "peak-only") await this.refreshPricing(true);
+    await this.#notifyModeChanged(stored);
+    return true;
+  }
+
+  async #notifyModeChanged(mode: FreeUsageMode): Promise<void> {
+    try {
+      await this.#onModeChanged(mode);
+    } catch (error) {
+      this.#onError(error);
+    }
+  }
+
+  async #persistMode(mode: FreeUsageMode): Promise<boolean> {
+    try {
+      const record: ModeOverrideRecord = {
+        schemaVersion: MODE_SCHEMA_VERSION,
+        mode,
+        updatedAt: this.#clock.now(),
+      };
+      await this.#storage.set(MODE_STORAGE_KEY, record);
+      return true;
+    } catch (error) {
+      this.#onError(error);
+      return false;
+    }
+  }
+
+  async #readMode(): Promise<FreeUsageMode | undefined> {
+    return this.#decodeMode(await this.#safeGet(MODE_STORAGE_KEY));
+  }
+
+  #decodeMode(value: unknown): FreeUsageMode | undefined {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const document = value as Record<string, unknown>;
+    if (document.schemaVersion !== MODE_SCHEMA_VERSION) return undefined;
+    return document.mode === "always-free-first" ||
+      document.mode === "peak-only" ||
+      document.mode === "off"
+      ? document.mode
+      : undefined;
+  }
+
   setVariantIndex(index: ReadonlyMap<string, readonly string[]>): void {
     this.#variantIndex.clear();
     for (const [key, value] of index) this.#variantIndex.set(key, value);
@@ -1118,6 +1330,17 @@ export class FreeFirstEngine {
   rememberDefault(model: ModelRef | undefined): void {
     if (model === undefined || this.#isPrimary(model)) return;
     this.#defaultModel = model;
+  }
+
+  /**
+   * Remember the default this plugin itself published. A new session that
+   * starts on that model is following the plugin's default, not making a manual
+   * choice, so it must stay eligible for a later mode change (for example Peak
+   * Only -> Free First) instead of being recorded as a user override.
+   */
+  rememberPublishedDefault(model: ModelRef | undefined): void {
+    this.#publishedDefault =
+      model === undefined ? undefined : { providerID: model.providerID, id: model.id };
   }
 
   /** Remember the model a session used before it moved to the free model. */
@@ -1138,7 +1361,7 @@ export class FreeFirstEngine {
       if (state.optOut !== undefined) manualOverrides += 1;
     }
     const activeRoute: EngineStatus["activeRoute"] =
-      !this.#enabled || this.#config.freeUsageMode === "off"
+      !this.#enabled || this.#mode === "off"
         ? "NONE"
         : this.#pricingBlocksFree() && this.#config.fallback !== undefined
           ? "GO"
@@ -1159,8 +1382,11 @@ export class FreeFirstEngine {
         this.#config.fallback === undefined
           ? "session-previous-or-default"
           : modelRefKey(this.#config.fallback),
-      freeUsageMode: this.#config.freeUsageMode,
-      ...(this.#config.freeUsageMode === "peak-only"
+      freeUsageMode: this.#mode,
+      configuredFreeUsageMode: this.#config.freeUsageMode,
+      freeUsageModeSource: this.modeSource,
+      routingActive: this.#active(),
+      ...(this.#mode === "peak-only"
         ? {
             pricingState: this.#pricing?.state ?? ("UNKNOWN" as const),
             ...(this.#pricing?.nextTransition === undefined
@@ -1236,10 +1462,10 @@ export class FreeFirstEngine {
   /** One-line status suitable for a log line or a status widget. */
   statusLine(): string {
     if (!this.#enabled) return "disabled";
-    if (this.#config.freeUsageMode === "off") return "disabled (free usage mode off)";
+    if (this.#mode === "off") return "Free-first disabled (mode: disabled)";
     const heuristic = this.#sessionsState.size > 0 ? this.#config.primary : this.#config.primary;
     const state = healthState(this.#health, this.#clock.now());
-    if (this.#config.freeUsageMode === "peak-only") {
+    if (this.#mode === "peak-only") {
       const pricing = this.#pricing?.state ?? "UNKNOWN";
       if (pricing !== "PEAK") {
         return `FREE policy: PEAK_ONLY | Pricing: ${pricing} | Active route: GO | Free preserved until PEAK`;
@@ -1276,7 +1502,7 @@ export class FreeFirstEngine {
   /* ------------------------------------------------------------- internals */
 
   #active(): boolean {
-    return this.#enabled && this.#config.freeUsageMode !== "off" && !this.#disposed;
+    return this.#enabled && this.#mode !== "off" && !this.#disposed;
   }
 
   /**
@@ -1285,7 +1511,7 @@ export class FreeFirstEngine {
    * verified PEAK window authorizes it.
    */
   #pricingBlocksFree(): boolean {
-    if (this.#config.freeUsageMode !== "peak-only") return false;
+    if (this.#mode !== "peak-only") return false;
     return this.#pricing?.state !== "PEAK";
   }
 
@@ -1684,9 +1910,24 @@ export class FreeFirstEngine {
    * plugin's storage. A limit is a property of the provider account, so the
    * longest live cooldown and the highest ladder position are the truth.
    */
-  async #adoptPersistedCooldown(): Promise<void> {
-    const raw = await this.#safeGet(HEALTH_STORAGE_KEY);
-    const stored = decodeHealth(raw, modelRefKey(this.#config.primary));
+  async #adoptPersistedState(adoptMode = true): Promise<void> {
+    const [rawHealth, rawMode] = await Promise.all([
+      this.#safeGet(HEALTH_STORAGE_KEY),
+      adoptMode ? this.#safeGet(MODE_STORAGE_KEY) : Promise.resolve(undefined),
+    ]);
+    const storedMode = this.#decodeMode(rawMode);
+    if (storedMode !== undefined && storedMode !== this.#mode) {
+      this.#log("info", "adopted free usage mode saved by another instance", {
+        from: this.#mode,
+        to: storedMode,
+      });
+      this.#mode = storedMode;
+      this.#modeOverride = true;
+      if (storedMode === "peak-only") await this.refreshPricing(true);
+      await this.#notifyModeChanged(storedMode);
+      this.#schedule();
+    }
+    const stored = decodeHealth(rawHealth, modelRefKey(this.#config.primary));
     if (stored === undefined) return;
     const now = this.#clock.now();
     const storedCooldown = stored.cooldownUntil ?? 0;
@@ -1824,7 +2065,9 @@ export class FreeFirstEngine {
       // Never let a write downgrade a live cooldown another instance recorded.
       // This is what keeps the shared record monotonic with respect to an active
       // cooldown: a stale healthy instance adopts it instead of clobbering it.
-      await this.#adoptPersistedCooldown();
+      // Mode adoption is skipped here: a background flush (including dispose)
+      // must not rebuild model defaults.
+      await this.#adoptPersistedState(false);
       await this.#storage.set(HEALTH_STORAGE_KEY, this.#health as unknown as never);
       const sessions: Record<string, SessionRecord> = {};
       for (const [sessionID, state] of this.#sessionsState) {
@@ -1891,6 +2134,7 @@ export class FreeFirstEngine {
   /* ------------------------------------------------------------- scheduler */
 
   #nextProbeAt(): number | undefined {
+    if (!this.#active()) return undefined;
     if (!this.#config.probe) return undefined;
     if (this.#health.state === "FREE_HEALTHY") return undefined;
     if (!this.#pricingAllowsFree()) return undefined;
@@ -1898,6 +2142,7 @@ export class FreeFirstEngine {
   }
 
   #nextDeadline(): number | undefined {
+    if (!this.#active()) return undefined;
     const now = this.#clock.now();
     let due: number | undefined;
     const consider = (at: number | undefined): void => {
@@ -1957,6 +2202,7 @@ export class FreeFirstEngine {
 
   async #tick(): Promise<void> {
     if (this.#disposed) return;
+    if (!this.#active()) return;
     if (this.#expireCooldown()) await this.#recovery();
     else await this.#preemptParkedSessions();
     this.#schedule();
@@ -1975,6 +2221,7 @@ export class FreeFirstEngine {
    * model call confirms recovery passively.
    */
   async #recovery(): Promise<void> {
+    if (!this.#active()) return;
     if (this.#probe !== undefined) return; // one probe decides for everyone
     await this.refreshPricing();
     if (this.#pricingBlocksFree()) {
@@ -2079,7 +2326,9 @@ export class FreeFirstEngine {
    * cannot run is not evidence that the free model is unusable.
    */
   async #runProbe(): Promise<ProbeOutcome> {
-    await this.#adoptPersistedCooldown();
+    if (!this.#active()) return "inconclusive";
+    await this.#adoptPersistedState();
+    if (!this.#active()) return "inconclusive";
     await this.refreshPricing();
     if (this.#pricingBlocksFree()) {
       this.#log("info", "recovery probe skipped: free is not eligible under the pricing policy");
@@ -2213,6 +2462,7 @@ export class FreeFirstEngine {
    * obsolete paid work can never run twice.
    */
   async #preemptParkedSessions(): Promise<void> {
+    if (!this.#active()) return;
     if (!this.#config.parkPreemption) return;
     // Preemption re-interrupts an active execution, so it only happens once the
     // free model is confirmed usable: never on a guess, and never off-peak.

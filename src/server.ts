@@ -30,8 +30,8 @@ import {
   OFFPEAK_CANCEL_HOLD_RPC,
   OFFPEAK_PRICING_RPC,
 } from "./offpeak.js";
-import type { FreeFirstRpcInput, FreeFirstRpcOutput } from "./rpc.js";
-import { FREE_FIRST_RPC, FREE_FIRST_USAGE } from "./rpc.js";
+import type { FreeFirstRpcOutput } from "./rpc.js";
+import { FREE_FIRST_RPC, handleFreeFirstControl } from "./rpc.js";
 import type { ModelRef } from "./types.js";
 import { modelRefKey } from "./types.js";
 
@@ -81,6 +81,7 @@ export default Plugin.define({
     const storage: StateStore = {
       get: (key) => context.storage.get(key) as Promise<unknown>,
       set: (key, value) => context.storage.set(key, value as never),
+      remove: (key) => context.storage.remove(key),
     };
 
     let engine: FreeFirstEngine;
@@ -121,9 +122,11 @@ export default Plugin.define({
         : undefined;
 
     // The canonical pricing classification. It is owned by opencode-offpeak;
-    // this plugin only consumes it, and only when `peak-only` is configured.
+    // this plugin only consumes it. The port is always wired (it does nothing
+    // until evaluated) because the mode can be switched to `peak-only` at
+    // runtime from the TUI or the control RPC.
     const pricing =
-      config.freeUsageMode === "peak-only" && resolved.error === undefined
+      resolved.error === undefined
         ? createPricingPort(
             (input) => context.rpc(OFFPEAK_PRICING_RPC).pricing({ ...input }),
             (error) => {
@@ -150,6 +153,12 @@ export default Plugin.define({
       },
       onProbeState: (active) => {
         probing = active;
+      },
+      onModeChanged: async (mode) => {
+        // Rebuild the model registry before the next step resolves its model,
+        // so a mode change is reflected in the default selection immediately.
+        logger.info("free usage mode applied; reloading model defaults", { mode });
+        await context.model.reload();
       },
       sessions: {
         switchModel: async ({ sessionID, model }) => {
@@ -198,12 +207,18 @@ export default Plugin.define({
 
     const registrations: Array<{ dispose: () => Promise<void> }> = [];
 
+    // Restore persisted derived state first: a mode saved from the TUI must
+    // decide the initial pricing query and the published default model.
+    await engine.start();
+
     // Resolve the canonical pricing classification before publishing a default,
     // so an off-peak start never advertises the free route.
-    if (config.freeUsageMode === "peak-only" && resolved.error === undefined) {
+    if (engine.mode === "peak-only" && resolved.error === undefined) {
       const snapshot = await engine.refreshPricing(true);
       logger.info("free usage policy resolved", {
-        freeUsageMode: config.freeUsageMode,
+        freeUsageMode: engine.mode,
+        configuredFreeUsageMode: engine.configuredMode,
+        modeSource: engine.modeSource,
         pricingState: snapshot?.state ?? "UNKNOWN",
         nextTransition: snapshot?.nextTransition,
       });
@@ -238,10 +253,11 @@ export default Plugin.define({
       ) {
         engine.rememberDefault({ providerID: currentProvider, id: currentModel });
       }
-      if (config.enabled && config.preferAsDefault) {
+      if (config.enabled && engine.mode !== "off" && config.preferAsDefault) {
         const preferred = engine.defaultTarget();
         const target = editor.get(preferred.providerID, preferred.id);
         if (target === undefined) {
+          engine.rememberPublishedDefault(undefined);
           logger.error(
             "preferred model is not available; leaving the default selection unchanged",
             {
@@ -250,7 +266,10 @@ export default Plugin.define({
           );
         } else {
           editor.default.set(preferred.providerID, preferred.id);
+          engine.rememberPublishedDefault(preferred);
         }
+      } else {
+        engine.rememberPublishedDefault(undefined);
       }
     });
     registrations.push(transform);
@@ -452,37 +471,43 @@ export default Plugin.define({
 
     const rpc = await context.rpc.register(FREE_FIRST_RPC, {
       control: async (rawInput: unknown): Promise<FreeFirstRpcOutput> => {
-        const input = rawInput as FreeFirstRpcInput;
-        switch (input.action) {
-          case "status":
-          case "pricing":
-            // Report the whole instance's view, not one location's memory.
-            await engine.refresh();
-            return { status: engine.status() as unknown as Record<string, unknown> };
-          case "on":
-            engine.setEnabled(true);
-            await engine.refresh();
-            return { message: `opencode-free-first is ON. ${engine.statusLine()}` };
-          case "off":
-            engine.setEnabled(false);
-            return {
-              message:
-                "opencode-free-first is OFF. No routing, failover, probing, or timer remains active; persisted cooldown state is preserved.",
-            };
-          case "reset":
-            engine.markHealthy("rpc-reset");
-            return {
-              message: "Free-first cooldown cleared.",
-              status: engine.status() as unknown as Record<string, unknown>,
-            };
-          default:
-            throw new Error(FREE_FIRST_USAGE);
+        const output = await handleFreeFirstControl(engine, rawInput);
+        if (output.mode !== undefined) {
+          // The engine already rebuilt this location's model defaults through
+          // `onModeChanged`. Every location has its own plugin instance, so the
+          // event lets the others adopt the same saved mode now instead of at
+          // their next prompt.
+          try {
+            await rpc.events.emit("transition", {
+              to: output.mode,
+              reason: "mode-change",
+            });
+          } catch (error) {
+            logger.error("failed to propagate a mode change", {
+              detail: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
+        return output;
       },
     });
     registrations.push(rpc);
 
-    await engine.start();
+    const rpcClient = context.rpc(FREE_FIRST_RPC);
+    const unsubscribeMode = rpcClient.events.on("transition", (event) => {
+      if (event.data.reason !== "mode-change") return;
+      void (async () => {
+        if (!(await engine.syncMode())) return;
+        await engine.refresh();
+        logger.info("adopted a mode saved by another location", { mode: engine.mode });
+      })().catch((error) => {
+        logger.error("failed to adopt a mode saved by another location", {
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      });
+    });
+    registrations.push({ dispose: async () => unsubscribeMode() });
+
     logger.info("ready", { status: engine.statusLine() });
 
     return async () => {

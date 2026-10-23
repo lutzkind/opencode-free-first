@@ -11,7 +11,7 @@ shares state, and neither duplicates the other's responsibility.
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    "git+https://github.com/lutzkind/opencode-offpeak.git#v0.1.6",
+    "git+https://github.com/lutzkind/opencode-offpeak.git#v0.2.0",
     {
       "package": "opencode-free-first",
       "options": {
@@ -26,6 +26,21 @@ shares state, and neither duplicates the other's responsibility.
 Order matters in exactly one way: a plugin that can veto a retry must be listed
 **before** `opencode-free-first`, so free-first's retry hook — the failover — has
 the last word. OpenCode runs same-name hooks in plugin order.
+
+## Two separate controls
+
+The names are similar, so the boundary is explicit:
+
+| Control | Owner | Meaning |
+| --- | --- | --- |
+| `/offpeak off` | `opencode-offpeak` | Pause offpeak's automation/protection. Free-first keeps routing normally. |
+| `/free-first mode disabled` | `opencode-free-first` | Stop free-first management. Offpeak keeps its own settings and paid-price protection. |
+| `/free-first mode peak-only` | `opencode-free-first` | Consume offpeak's read-only `pricing` answer; only a positive `PEAK` allows Free. |
+| `/free-first mode free-first` | `opencode-free-first` | Use Free whenever healthy, regardless of pricing. |
+
+`/offpeak off` never disables Free-first, and Free-first disabled never changes
+offpeak's configuration, queue, holds, session overrides, or pricing windows.
+The real-TUI test asserts both directions.
 
 ## Verified cases
 

@@ -79,7 +79,7 @@ describe("free usage modes", () => {
     assert.equal(built.sessions.of("switchModel").length, 0);
     assert.equal(engine.status().freeUsageMode, "off");
     assert.equal(engine.status().activeRoute, "NONE");
-    assert.match(engine.statusLine(), /free usage mode off/);
+    assert.match(engine.statusLine(), /Free-first disabled/);
   });
 });
 

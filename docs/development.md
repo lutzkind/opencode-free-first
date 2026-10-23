@@ -19,6 +19,7 @@ npm run check          # lint + typecheck + unit tests
 | `npm run compile` | Emit `dist/` for Node consumers and tests |
 | `npm test` | Compile, then hermetic unit tests |
 | `npm run test:integration` | Real CLI + real `opencode-offpeak` + mock provider |
+| `npm run test:tui` | Real OpenCode TUI on the installed binary via tmux |
 | `npm run test:offpeak-regression` | The neighbour plugin's own checks |
 | `npm pack --dry-run` | Inspect the published file list |
 
@@ -27,13 +28,15 @@ npm run check          # lint + typecheck + unit tests
 ```
 index.ts            directory-install entrypoint (re-exports the server entry)
 server.ts           directory-install entrypoint (re-exports the server entry)
+tui.ts              directory-install CLI entrypoint (re-exports src/tui.ts)
 src/server.ts       plugin definition: hooks, events, transform, RPC
+src/tui.ts          native /free-first commands and mode selector (RPC client)
 src/engine.ts       orchestration and the single recovery path
 src/health.ts       state machine, ladder, jitter, persistence codec
 src/classify.ts     rate-limit classification and reset metadata
 src/config.ts       option and file resolution, validation
 src/log.ts          redacting logger
-src/rpc.ts          RPC definition
+src/rpc.ts          control-RPC definition and context-free handler
 src/types.ts        shared types and storage keys
 test/               unit tests, fakes, integration suite, mock provider
 docs/               operator-facing documentation
@@ -48,7 +51,9 @@ type declarations, and because the tests exercise the compiled output, which als
 guarantees the code type-checks.
 
 A directory install resolves `<dir>/server` and `<dir>/index`, which is why both
-`server.ts` and `index.ts` exist at the repository root.
+`server.ts` and `index.ts` exist at the repository root. The TUI companion is
+loaded from the package's `./tui` export, so `tui.ts` and `src/tui.ts` must stay
+in the published package.
 
 ## Adding a rate-limit signal
 

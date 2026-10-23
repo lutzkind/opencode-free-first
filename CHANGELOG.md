@@ -1,4 +1,69 @@
-## [0.2.0] — ## [0.2.1] — 2026-10-23
+# Changelog
+
+Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and [semantic versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.3.0] — 2026-10-23
+
+### Added
+
+- **Native in-OpenCode mode control.** A CLI companion (`./tui`) registers
+  `/free-first`, `/free-first status`, and
+  `/free-first mode free-first|peak-only|disabled`, plus a native selector with
+  the active mode marked. The selector and commands are thin clients of the
+  existing control RPC; no custom UI framework or second state store was added.
+- **Persistent, explicit mode precedence.** A mode chosen in the TUI (or through
+  the RPC) is saved under `opencode-free-first/mode-v1` and survives new
+  sessions, plugin reload, OpenCode restart, and server restart. Precedence is
+  saved choice > configured `freeUsageMode` > `always-free-first`; the existing
+  `enabled` master switch still wins. `/free-first mode configured` (RPC
+  `clear-mode`) removes the saved choice.
+- **Status fields for the control surface.** `status` now also reports
+  `configuredFreeUsageMode`, `freeUsageModeSource` (`override`/`config`), and
+  `routingActive`, alongside the existing pricing, route, health, and model
+  fields.
+- **Live mode propagation.** A mode change rebuilds the location's model
+  defaults with the supported `model.reload` API and emits the existing portable
+  `transition` RPC event, so other locations adopt the same saved mode instead of
+  advertising a stale default.
+
+### Changed
+
+- **The user-facing modes are now named Free First, Peak Only, and Free-first
+  disabled.** The third choice is never presented as just "Off": `/offpeak off`
+  is a different control owned by `opencode-offpeak`. Both directions are
+  asserted in the real TUI.
+- **A real fallback dispatch is recorded as a fallback session.** A title or
+  auxiliary request that reaches the provider before prompt admission no longer
+  leaves a new session recorded as unmanaged on PRIMARY, so a later
+  Peak Only → Free First switch can return it to Free.
+- **Disabling free-first clears its timers and stops probes immediately.** The
+  scheduler now respects the master switch and the effective mode, so the RPC's
+  "no timer remains active" claim is true.
+
+### Compatibility
+
+- **OpenCode `>=2.0.26 <2.2.0`**, verified on the current production **2.1.3**
+  binary, including the real TUI (`keymap.layer`, `ui.dialog.select`,
+  `client.rpc`). The server plugin remains compatible with the same hooks as
+  v0.2.1.
+- Coexistence verified with `opencode-offpeak` `v0.2.0`; no changes were made to
+  that plugin or to `/offpeak` semantics.
+
+### Tests
+
+- The default suite now has 364 tests (the opt-in real-TUI case is skipped
+  without `FF_TUI_SMOKE=1`). New coverage includes the selector and every slash
+  command against a fake TUI context, mode persistence across reload/restart,
+  all transition directions, zero Free calls/probes after Peak Only off-peak,
+  cooldown preservation, active-turn/compaction/manual-override safety, control
+  RPC wording, and package entrypoints.
+- Real OpenCode 2.1.3: the existing 21-case coexistence suite, a new live
+  mode-switch integration case (Peak Only → Free First → Peak Only, server
+  restart, Disabled, zero Free requests off-peak), and the new tmux-driven TUI
+  smoke test all pass.
+
+## [0.2.1] — 2026-10-23
 
 ### Fixed
 
@@ -8,7 +73,7 @@
   line was already correct; the structured field now agrees with it. No routing
   behaviour changed.
 
-2026-10-23
+## [0.2.0] — 2026-10-23
 
 ### Added
 
@@ -63,11 +128,6 @@
   weekend/holiday classifications, cooldown crossing, cross-instance state,
   restart, compaction, active-turn PEAK→OFF behaviour, `context_length_exceeded`
   non-failover, and the concurrent-2xx regression.
-
-# Changelog
-
-Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.10] — 2026-10-18
 
