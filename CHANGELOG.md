@@ -1,3 +1,59 @@
+## [0.2.0] — 2026-10-23
+
+### Added
+
+- **`freeUsageMode` with `always-free-first` (default), `peak-only`, and `off`.**
+  `peak-only` reserves DeepSeek Free for verified PEAK pricing periods and sends
+  off-peak, weekend, and Chinese statutory-holiday traffic straight to Go. It
+  requires an explicit fallback. The default preserves existing installations.
+- **Canonical pricing consumption, not a second calendar.** `peak-only` calls a
+  read-only `pricing` RPC on `opencode-offpeak` and accepts only a positive
+  `PEAK` answer. `OFF_PEAK`, `FLAT`, `UNTRACKED`, `UNKNOWN`, a missing plugin, and
+  an RPC failure all keep Free closed. No schedule, holiday table, daemon,
+  scheduler, queue, proxy, or state store was added.
+- **Pricing-aware routing boundaries.** Prompt admission, request preparation,
+  retry, recovery, and probe dispatch refresh the cached classification; the
+  cache expires at the earlier of the canonical `nextTransition` and 60 seconds.
+  At OFF_PEAK an elapsed cooldown is cleared without a probe and executing or
+  newly admitted Free sessions move to Go at the next step. The model transform
+  publishes Go as the default off-peak.
+- **Status visibility.** `status` now reports `freeUsageMode`, `pricingState`,
+  `pricingNextTransition`, `pricingPolicyID`, `pricingReason`, and `activeRoute`
+  (`FREE`, `GO`, `MIXED`, `NONE`); the status line names the policy, pricing
+  state, and route, and still reports a legitimate cooldown/fallback reason.
+
+### Fixed
+
+- **OpenCode 2.1 concurrent title/auxiliary responses can no longer fake a Free
+  recovery.** A free request dispatched while Free was cooling down (typically an
+  automatic title) returned 2xx and cleared the cooldown, masking the recovery
+  probe's refusal. A 2xx now counts only when the request was dispatched while
+  Free was eligible and no probe was in flight.
+
+### Compatibility
+
+- **OpenCode `>=2.0.26 <2.2.0`**, verified against the current production
+  **2.1.3** binary as well as 2.0.27/2.0.30. OpenCode 2.1 changed the
+  session/compaction payload schema (`providerState` → `native`), not the plugin
+  hooks this package uses; the previous `<2.1.0` range was unnecessarily narrow.
+  Buffered model calls now retry internally, so a structurally refused recovery
+  probe settles after the bounded OpenCode retry schedule instead of instantly;
+  it is still bounded and never blocks Free permanently.
+- Coexistence verified with `opencode-offpeak` `v0.2.0` on 2.1.3, including
+  OFF_PEAK + `peak-only` (Go only, zero Free calls), PEAK + healthy Free (offpeak
+  does not block it), PEAK + Free 429 (paid Go stays held by offpeak's cost
+  protection, then Free recovery reclaims it), and an OFF_PEAK compaction (Go,
+  zero Free requests).
+
+### Tests
+
+- 311 deterministic unit tests (up from 287) plus 21 real-OpenCode coexistence
+  cases, all green on OpenCode 2.1.3. New coverage includes all three modes, the
+  strict-PEAK matrix, OFF_PEAK probe suppression, PEAK/OFF_PEAK boundaries,
+  weekend/holiday classifications, cooldown crossing, cross-instance state,
+  restart, compaction, active-turn PEAK→OFF behaviour, `context_length_exceeded`
+  non-failover, and the concurrent-2xx regression.
+
 # Changelog
 
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)

@@ -90,6 +90,39 @@ describe("validateConfig", () => {
     assert.equal(DEFAULT_CONFIG.routeRejectRetryMs, 300_000);
   });
 
+  it("defaults to always-free-first for backward compatibility", () => {
+    const result = validateConfig({});
+    assert.equal(result.error, undefined);
+    assert.equal(result.config.freeUsageMode, "always-free-first");
+    assert.equal(DEFAULT_CONFIG.freeUsageMode, "always-free-first");
+  });
+
+  it("accepts peak-only with a concrete fallback", () => {
+    const result = validateConfig({
+      freeUsageMode: "peak-only",
+      fallback: "opencode-go/deepseek-v4.1-flash",
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.config.freeUsageMode, "peak-only");
+  });
+
+  it("rejects an unknown free usage mode", () => {
+    assert.match(validateConfig({ freeUsageMode: "sometimes" }).error, /freeUsageMode/);
+  });
+
+  it("rejects peak-only without an explicit fallback", () => {
+    assert.match(
+      validateConfig({ freeUsageMode: "peak-only" }).error,
+      /peak-only.*requires an explicit fallback/,
+    );
+  });
+
+  it("accepts the off mode", () => {
+    const result = validateConfig({ freeUsageMode: "off" });
+    assert.equal(result.error, undefined);
+    assert.equal(result.config.freeUsageMode, "off");
+  });
+
   it("rejects a non-boolean switch", () => {
     assert.match(validateConfig({ enabled: "yes" }).error, /enabled must be a boolean/);
   });

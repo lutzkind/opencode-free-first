@@ -10,7 +10,7 @@ const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 
 describe("package shape", () => {
   it("declares the OpenCode support range it is tested against", () => {
-    assert.equal(pkg.engines.opencode, ">=2.0.26 <2.1.0");
+    assert.equal(pkg.engines.opencode, ">=2.0.26 <2.2.0");
     assert.equal(pkg.dependencies["@opencode/plugin"], "2.0.26");
   });
 

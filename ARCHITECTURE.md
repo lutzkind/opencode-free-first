@@ -16,6 +16,12 @@ The governing rule:
 It is deliberately small. There is no provider stack, no proxy, no queue, no
 scheduler for paid work, no daemon, and no second database.
 
+Compatibility: the package declares and tests OpenCode `>=2.0.26 <2.2.0`. The
+current production binary is 2.1.3. OpenCode 2.1's breaking session-schema change
+(`providerState` → `native`) does not touch the hooks used here; its new internal
+retry of buffered model calls only delays a refused recovery probe until the
+bounded retry schedule finishes. The real-CLI coexistence suite runs on 2.1.3.
+
 ## Responsibility boundary
 
 ```
@@ -48,6 +54,29 @@ Free-first never calls a provider itself. Its only provider-facing call is the
 recovery probe, and that goes through `ctx.generate.text`, which uses OpenCode's
 own routing, credentials, and configured free model.
 
+### Free usage policy
+
+`freeUsageMode` is a routing policy layered on top of availability. It does not
+own time windows. In `peak-only`, free eligibility is the conjunction of:
+
+1. the existing free health state says the route is usable, and
+2. `opencode-offpeak`'s read-only `pricing` RPC positively reports `PEAK` for the
+   configured fallback model.
+
+The RPC answer is cached until the earlier of its `nextTransition` and a
+60-second freshness bound; no timer is created. The mode is re-evaluated at
+prompt admission, request preparation, retry, recovery, and probe dispatch, so
+the first safe boundary after a PEAK/OFF_PEAK change applies the new route.
+`OFF_PEAK`, `FLAT`, `UNTRACKED`, `UNKNOWN`, a missing capability, and an RPC
+failure all mean **not eligible**; only a positive PEAK answer can spend free
+quota. `always-free-first` bypasses this gate; `off` disables the engine.
+
+At OFF_PEAK an elapsed cooldown is cleared without a probe, recovery is not
+entered, and executing or newly admitted sessions represented on Free are routed
+to Go. At PEAK the existing failover/recovery state machine is unchanged. When a
+peak-only failover selects Go during PEAK, the paid request remains subject to
+`opencode-offpeak`'s hold; free-first never bypasses that cost protection.
+
 ## Components
 
 | File | Responsibility |
@@ -56,7 +85,8 @@ own routing, credentials, and configured free model.
 | `src/health.ts` | The availability state machine, both backoff ladders, jitter, persistence codec. Pure. |
 | `src/config.ts` | Option/file resolution and validation. Never throws; invalid input disables the plugin. |
 | `src/log.ts` | Prefixed structured logging with credential redaction. |
-| `src/engine.ts` | Orchestration: session tracking, routing, failover, recovery, park reclamation, persistence, timers. |
+| `src/engine.ts` | Orchestration: session tracking, pricing-aware routing, failover, recovery, park reclamation, persistence, timers. |
+| `src/offpeak.ts` | Optional neighbour RPC ports: paid-hold cancellation and the canonical read-only `pricing` query. |
 | `src/rpc.ts` | Diagnostic RPC definition. |
 | `src/server.ts` | Binds the engine to OpenCode's hooks, events, transforms, and RPC. |
 
@@ -158,16 +188,16 @@ cannot move a session the user repointed while OpenCode was stopped.
 
 | Extension point | Use |
 | --- | --- |
-| `model.transform` | Publish the free model as the default selection, capture each model's variant ids, capture OpenCode's own default before overriding it. |
-| `prompt` | Last point before a turn resolves its model: converge routing without spending a request on a model known to be cooling down. |
-| `context` | Observe request preparation (the park signal), adopt a cooldown another instance recorded — in both directions, so a preparation on the free model is guarded too — and route a fallback session back to the free model when the cooldown has elapsed. |
+| `model.transform` | Publish the mode-appropriate default selection (Free at PEAK/always, Go at peak-only OFF_PEAK), capture each model's variant ids, capture OpenCode's own default before overriding it. |
+| `prompt` | Last point before a turn resolves its model: refresh pricing, converge routing, and never spend a request on a model known to be cooling down or ineligible under `peak-only`. |
+| `context` | Observe request preparation (the park signal), adopt a cooldown another instance recorded — in both directions — route a Free session to Go when `peak-only` is off-peak, and route a fallback session back to Free only when pricing allows it and the cooldown has elapsed. |
 | `generate` | Bound the recovery probe's output. The probe is best-effort: only a real rate limit or a positively identified transient outage may block the free model. |
 | `model.request` | Confirm a request is about to be dispatched — the request is no longer held. |
-| `http.response` | Prove free health from a non-error response; capture reset headers. |
+| `http.response` | Prove free health from a non-error response that was dispatched while Free was eligible and no recovery probe was in flight; capture reset headers. Concurrent OpenCode 2.1 title/auxiliary requests cannot clear a real cooldown or overtake a probe. |
 | `retry` | The failover decision: record the cooldown (`rate-limit`, `free-route`, or `transient-availability`), switch the model, force one cheap retry. Anything else stays visible. |
 | `generate` | Bound the recovery probe's output while it is in flight. |
 | `event.subscribe` | `session.execution.started|succeeded|failed|interrupted` and `session.model.selected`. |
-| `rpc.register` | Diagnostics and operator controls. |
+| `rpc.register` | Diagnostics and operator controls, including the current mode, pricing state, next transition, and active route. |
 
 Each hook registration is disposed on unload, the event subscription is aborted,
 and the engine clears every timer on dispose, so a plugin reload cannot leave a
@@ -454,6 +484,9 @@ The distinction the whole classifier rests on:
 | A transient outage while a live limit cooldown is longer | The outage is recorded (ladder, timestamps) but the cooldown keeps the limit's label and deadline; neither cause overwrites the other's bookkeeping. |
 | A herd reaching cooldown expiry together | One probe; its result is reused for every waiting session. |
 | A probe fails while another session works on the fallback | The working session is never touched. |
+| A title/auxiliary 2xx during a cooldown or probe (OpenCode 2.1) | Not a recovery proof: it is ignored, so it cannot clear the cooldown or race the probe. |
+| PEAK → OFF_PEAK while a turn is active | The in-flight request is not recalled; the next step or request is routed to Go. |
+| OFF_PEAK with a stale Free cooldown | It is cleared silently at the next boundary; no probe is sent and the session stays on Go. |
 | OpenCode restart during a cooldown | A future cooldown is restored, an expired one is discarded, none is probed at startup. |
 | A plugin reload | Registrations and timers are disposed and rebuilt; no duplicate listeners. |
 | Explicit user model change during a cooldown | Respected; the session is no longer managed. |
@@ -464,8 +497,8 @@ The distinction the whole classifier rests on:
 Every switch is recorded as `<timestamp> <trigger> -> provider/model`, where the
 trigger is one of `failover` (rate limit), `route-reject-failover` (free-route
 gate), `availability-failover` (transient outage), `prompt-admission`,
-`context-guard`, `passive-recovery`, `probe-recovery`, `park-preemption`, or
-`cooldown-guard`. The last 40 are
+`context-guard`, `off-peak-guard`, `passive-recovery`, `probe-recovery`,
+`park-preemption`, or `cooldown-guard`. The last 40 are
 exposed through `status().transitions`, which is what the switch-churn tests
 assert against: a complete free-limit cycle is exactly two transitions.
 

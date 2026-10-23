@@ -5,6 +5,11 @@ it, so each item needs evidence before it is implemented.
 
 ## Recently closed
 
+- **Peak-only free usage (v0.2.0).** Closed with `freeUsageMode` and a read-only
+  `pricing` RPC from `opencode-offpeak`: Free is spent only in a verified PEAK
+  window, off-peak/weekend/holiday traffic routes to Go with no Free request or
+  probe, and the default remains `always-free-first`.
+
 - **Transient free-route availability failures (v0.1.10).** Closed by one
   `transient-availability` category (provider 5xx, structured provider-internal/
   timeout, qualifying transport failures) that reuses the shared cooldown with its
@@ -37,7 +42,8 @@ it, so each item needs evidence before it is implemented.
 ## Explicitly out of scope
 
 - Off-peak windows, pricing, holiday calendars, queues, and holds — a cost/time
-  policy plugin owns those.
+  policy plugin owns those. `peak-only` consumes their answer; it never copies
+  the calendar.
 - Provider proxying, credential management, or a second provider layer.
 - Any daemon, external database, Redis, external queue, or systemd unit.
 - A hosted or shared service of any kind.

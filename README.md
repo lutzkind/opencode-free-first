@@ -21,6 +21,12 @@ The governing rule:
 > Temporary free-route availability problems use the paid fallback. Permanent
 > request, account, configuration, or plugin failures stay visible.
 
+A second, opt-in rule controls *when* the free route may be spent:
+
+> In `peak-only` mode, DeepSeek Free is used only while the configured paid
+> fallback is in a verified PEAK pricing window. Off-peak, weekends, and Chinese
+> statutory holidays route straight to the paid fallback and never probe Free.
+
 Nothing here is a new provider stack, a proxy, a scheduler, or a queue. Real
 paid work keeps flowing through OpenCode's normal routing, so a cost/time policy
 plugin such as [`opencode-offpeak`](https://github.com/lutzkind/opencode-offpeak)
@@ -32,6 +38,7 @@ stays in charge of *when* paid work runs.
 - [What it does not do](#what-it-does-not-do)
 - [Install](#install)
 - [Configure](#configure)
+- [Free usage modes](#free-usage-modes)
 - [Coexistence](#coexistence)
 - [How it decides](#how-it-decides)
 - [Cache behaviour](#cache-behaviour)
@@ -121,7 +128,7 @@ OpenCode v2 accepts npm-compatible package specifications, including Git URLs
 and exact tags. Install the published release:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.1.10
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.2.0
 opencode plugin list
 ```
 
@@ -149,7 +156,8 @@ keeps everything in one file:
       "package": "opencode-free-first",
       "options": {
         "primary": { "providerID": "opencode", "id": "deepseek-v4.1-flash-free" },
-        "fallback": { "providerID": "opencode-go", "id": "deepseek-v4.1-flash" }
+        "fallback": { "providerID": "opencode-go", "id": "deepseek-v4.1-flash" },
+        "freeUsageMode": "peak-only"
       }
     }
   ]
@@ -168,6 +176,42 @@ model the session was on before, then OpenCode's own configured default.
 See [`docs/configuration.md`](docs/configuration.md) for every option, its
 default, and when to change it.
 
+## Free usage modes
+
+`freeUsageMode` decides when the free route may be used. The default preserves
+the historical behaviour of every existing installation.
+
+| Mode | Behaviour |
+| --- | --- |
+| `always-free-first` (default) | Prefer Free whenever it is healthy, at any hour. Existing installations keep this unless they opt in. |
+| `peak-only` | Use Free only when the canonical pricing owner positively reports **PEAK** for the configured fallback. `OFF_PEAK`, `FLAT`, `UNTRACKED`, and `UNKNOWN` all route to Go without a Free request or probe. Requires an explicit `fallback`. |
+| `off` | Free-first routing is disabled. OpenCode's normal configured routing applies; no failover, recovery, probe, or default-model rewrite. |
+
+```jsonc
+{
+  "package": "opencode-free-first",
+  "options": {
+    "primary": { "providerID": "opencode", "id": "deepseek-v4.1-flash-free" },
+    "fallback": { "providerID": "opencode-go", "id": "deepseek-v4.1-flash" },
+    "freeUsageMode": "peak-only"
+  }
+}
+```
+
+`peak-only` is deliberately strict. It never copies the weekly windows or the
+Chinese holiday calendar: [`opencode-offpeak`](https://github.com/lutzkind/opencode-offpeak)
+remains the sole canonical owner and exposes a read-only `pricing` RPC. A
+missing or failed pricing capability is `UNKNOWN`, which is treated as
+not-PEAK, so it cannot accidentally spend free quota. At OFF_PEAK, cooldowns are
+left to expire silently, recovery probes are not sent, and every managed or
+newly admitted session is routed to Go before its next step. At PEAK, the
+existing 429, free-route-gate, and transient failover, cooldown, and recovery
+behaviour is unchanged.
+
+The status line and RPC expose the policy, the canonical pricing state, the next
+pricing transition, and the active route (`FREE`, `GO`, `MIXED`, or `NONE`), so a
+cooldown or fallback is never mistaken for the normal off-peak route.
+
 ## Coexistence
 
 `opencode-free-first` and a paid cost/time policy plugin such as
@@ -175,12 +219,18 @@ default, and when to change it.
 
 | Plugin | Owns |
 | --- | --- |
-| `opencode-free-first` | free-model availability, rate-limit failover, recovery |
-| `opencode-offpeak` | paid-route timing and cost policy |
+| `opencode-free-first` | free-model availability, rate-limit failover, recovery, free-usage mode |
+| `opencode-offpeak` | paid-route timing and cost policy — the sole PEAK/OFF_PEAK authority |
 
 They are independently installable, configurable, enableable, disableable,
 testable, and publishable. Neither imports the other, neither shares state, and
 neither duplicates the other's responsibility.
+
+`peak-only` consumes offpeak's canonical classification through one read-only
+RPC; it does not import the plugin, duplicate its calendar, or share mutable
+state. If offpeak holds a peak-priced Go request, that cost protection remains
+in force: free-first never bypasses it, and can only reclaim the parked request
+through the same `cancelHold` capability once Free is confirmed healthy.
 
 Two ordering facts matter, and both are verified by the live coexistence suite
 (`npm run test:integration`):
@@ -316,6 +366,9 @@ opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action
 | `transientFailures` | consecutive transient outages (the transient ladder position) |
 | `lastTransientAt` / `lastTransientType` | when the last outage was seen, and its stable classification (`failover-http-500`, `failover-structured-provider-internal`, `failover-transport-econnreset`, `probe-http-503`, …) |
 | `primary` / `fallback` | the effective routes |
+| `freeUsageMode` | `always-free-first`, `peak-only`, or `off` |
+| `pricingState` / `pricingNextTransition` | canonical PEAK/OFF_PEAK classification and its next boundary (`peak-only`) |
+| `activeRoute` | what new traffic uses now: `FREE`, `GO`, `MIXED`, or `NONE` |
 | `cooldownMs` / `cooldownEndsAt` | remaining and absolute cooldown |
 | `level` | position on the rate-limit backoff ladder |
 | `lastRateLimitAt` / `lastRateLimitType` | when and why the last limit was seen |
@@ -397,13 +450,13 @@ See [`docs/development.md`](docs/development.md) and
 
 | Component | Version |
 | --- | --- |
-| OpenCode | `>=2.0.26 <2.1.0` (verified on `2.0.27` and `2.0.30`) |
+| OpenCode | `>=2.0.26 <2.2.0` (verified on `2.0.27`, `2.0.30`, and `2.1.3`) |
 | Node | `>=22` for the compiled entry; OpenCode runs the TypeScript source on Bun |
 | `@opencode/plugin` | `2.0.26` |
 
-`opencode-offpeak` is optional and never a dependency. Verified coexistence:
-`opencode-offpeak` `v0.1.8` (the integration suite default) and `v0.1.10` (the
-live host) beside `opencode-free-first` on OpenCode `2.0.30`.
+`opencode-offpeak` is optional for `always-free-first`/`off` and required for
+`peak-only` at runtime. Verified coexistence: `opencode-offpeak` `v0.2.0` beside
+`opencode-free-first` `v0.2.0` on OpenCode `2.0.30` and `2.1.3`.
 
 ## License
 

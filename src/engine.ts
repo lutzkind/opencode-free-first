@@ -47,8 +47,16 @@ import {
   remainingCooldown,
 } from "./health.js";
 import type { Logger } from "./log.js";
-import type { CancelHoldResult, PaidHoldPort } from "./offpeak.js";
-import type { FreeState, HealthRecord, ModelRef, SessionRecord, SessionRoute } from "./types.js";
+import type { CancelHoldResult, PaidHoldPort, PricingPort, PricingSnapshot } from "./offpeak.js";
+import type {
+  FreeState,
+  FreeUsageMode,
+  HealthRecord,
+  ModelRef,
+  PricingState,
+  SessionRecord,
+  SessionRoute,
+} from "./types.js";
 import {
   HEALTH_SCHEMA_VERSION,
   HEALTH_STORAGE_KEY,
@@ -137,6 +145,8 @@ export interface EngineOptions {
    * without it reclamation keeps its interrupt-based fallback behaviour.
    */
   readonly paidHolds?: PaidHoldPort;
+  /** Canonical PEAK/OFF_PEAK classification, used only by `peak-only`. */
+  readonly pricing?: PricingPort;
   readonly logger: Logger;
   readonly random: () => number;
   readonly onError?: (error: unknown) => void;
@@ -150,6 +160,15 @@ export interface EngineStatus {
   readonly status: string;
   readonly primary: string;
   readonly fallback: string;
+  /** Configured free-usage policy. */
+  readonly freeUsageMode: FreeUsageMode;
+  /** Canonical pricing classification, present in `peak-only` mode. */
+  readonly pricingState?: PricingState;
+  readonly pricingNextTransition?: number;
+  readonly pricingPolicyID?: string;
+  readonly pricingReason?: string;
+  /** What new traffic routes to right now: FREE, GO, MIXED, or NONE. */
+  readonly activeRoute: "FREE" | "GO" | "MIXED" | "NONE";
   readonly cooldownMs: number;
   readonly cooldownEndsAt?: number;
   readonly nextProbeAt?: number;
@@ -237,6 +256,7 @@ export class FreeFirstEngine {
   readonly #sessions: SessionDriver;
   readonly #generate: GeneratePort;
   readonly #paidHolds: PaidHoldPort | undefined;
+  readonly #pricingPort: PricingPort | undefined;
   readonly #logger: Logger;
   readonly #random: () => number;
   readonly #onError: (error: unknown) => void;
@@ -264,7 +284,10 @@ export class FreeFirstEngine {
    * runner when it is retried, while a compaction request re-sends its own
    * prepared model.
    */
-  readonly #lastDispatch = new Map<string, { kind: string; model: ModelRef; at: number }>();
+  readonly #lastDispatch = new Map<
+    string,
+    { kind: string; model: ModelRef; at: number; freeEligible: boolean }
+  >();
   /** One cooldown routing pass at a time; a request during a pass re-runs it. */
   #cooldownRouting: Promise<void> | undefined;
   #cooldownRoutingPending = false;
@@ -279,6 +302,9 @@ export class FreeFirstEngine {
   #flushTimer: unknown;
   #probe: Promise<ProbeOutcome> | undefined;
   #probedAt: number | undefined;
+  #pricing: PricingSnapshot | undefined;
+  #pricingValidUntil = 0;
+  #pricingRefresh: Promise<PricingSnapshot | undefined> | undefined;
   #defaultModel: ModelRef | undefined;
   #disposed = false;
   #dirty = false;
@@ -290,6 +316,7 @@ export class FreeFirstEngine {
     this.#sessions = options.sessions;
     this.#generate = options.generate;
     this.#paidHolds = options.paidHolds;
+    this.#pricingPort = options.pricing;
     this.#logger = options.logger;
     this.#random = options.random;
     this.#onError = options.onError ?? (() => {});
@@ -384,11 +411,22 @@ export class FreeFirstEngine {
    */
   async onPrompt(sessionID: string): Promise<void> {
     if (!this.#active()) return;
+    await this.refreshPricing();
     // OpenCode loads one plugin instance per location and every instance shares
     // this plugin's storage, so a cooldown another instance recorded must apply
     // to this prompt. One keyed read per prompt is the price of a shared
     // cooldown across a long-lived service.
     await this.#adoptPersistedCooldown();
+    if (this.#pricingBlocksFree()) {
+      // Off-peak: the free route stays untouched. Expire an elapsed cooldown
+      // without probing it, then make sure every managed session that could
+      // reach a step boundary is on the paid route.
+      this.#normaliseElapsedCooldown();
+      const state = await this.#stateWithModel(sessionID);
+      await this.#applyRouting(sessionID, state, "off-peak-guard");
+      await this.#enforceCooldownRouting("off-peak-guard");
+      return;
+    }
     // Settling recovery here (when no probe is already in flight) is deliberate:
     // it decides this very prompt, so it must not be skipped. The work is one
     // tiny request.
@@ -410,6 +448,12 @@ export class FreeFirstEngine {
   async #applyRouting(sessionID: string, state: SessionState, trigger: string): Promise<void> {
     if (state.optOut !== undefined) return;
     await this.#adoptPersistedCooldown();
+    if (this.#pricingBlocksFree()) {
+      if (this.#isPrimary(state.model ?? this.#config.primary)) {
+        await this.#downgrade(sessionID, trigger);
+      }
+      return;
+    }
     if (this.#inCooldown()) {
       if (this.#isPrimary(state.model ?? this.#config.primary)) {
         await this.#downgrade(sessionID, trigger);
@@ -431,6 +475,7 @@ export class FreeFirstEngine {
    */
   async onContext(sessionID: string, model: ModelRef): Promise<void> {
     if (!this.#active()) return;
+    if (this.#config.freeUsageMode === "peak-only") await this.refreshPricing();
     const now = this.#clock.now();
     if (!this.#isRelevant(model)) {
       this.#prepared.delete(sessionID);
@@ -455,6 +500,20 @@ export class FreeFirstEngine {
     await this.#adoptPersistedCooldown();
 
     const state = await this.#stateWithModel(sessionID);
+    if (this.#pricingBlocksFree()) {
+      // Off-peak: never recover and never probe. A request already resolved to
+      // the free model is left to finish (the turn is in flight); the session
+      // is moved for the next attempt or step.
+      if (
+        this.#isPrimary(model) &&
+        state.optOut === undefined &&
+        (state.managed || this.#isPrimary(state.model ?? model))
+      ) {
+        await this.#downgrade(sessionID, "off-peak-guard");
+      }
+      await this.#enforceCooldownRouting("off-peak-guard");
+      return;
+    }
     if (this.#isFallback(model) && state.managed && state.route === "FALLBACK") {
       // The cooldown has elapsed, so the free model may be tested again and this
       // session should stop paying for the fallback. Recovery is centralised so
@@ -488,6 +547,11 @@ export class FreeFirstEngine {
       kind: kind ?? "unknown",
       model,
       at: this.#clock.now(),
+      // A request dispatched while the free route is known to be cooling down
+      // cannot later prove free health. OpenCode 2.1 issues concurrent
+      // title/auxiliary requests; one of those succeeding must not clear a real
+      // cooldown or race a recovery probe.
+      freeEligible: !this.#inCooldown() && this.#probe === undefined,
     });
 
     const state = this.#stateFor(sessionID);
@@ -516,6 +580,12 @@ export class FreeFirstEngine {
     if (!this.#active()) return;
     if (!this.#isPrimary(event.model)) return;
     if (event.status === 429) return; // the retry hook owns this transition
+    // While a probe is in flight it is the only verdict about free health.
+    // OpenCode 2.1 also issues concurrent title requests; they must not clear a
+    // cooldown or overtake the probe.
+    if (this.#probe !== undefined) return;
+    const dispatched = this.#lastDispatch.get(event.sessionID);
+    if (dispatched?.freeEligible === false) return;
     if (event.status < 400) this.#notePrimarySuccess("provider-2xx");
   }
 
@@ -616,6 +686,7 @@ export class FreeFirstEngine {
    */
   async onRetry(input: RetryInput): Promise<void> {
     if (!this.#active()) return;
+    await this.refreshPricing();
     if (this.#isFallback(input.model)) {
       await this.#resumeOnFreeAfterRefusal(input);
       return;
@@ -939,6 +1010,83 @@ export class FreeFirstEngine {
     this.#schedule();
   }
 
+  /**
+   * Refresh the canonical PEAK/OFF_PEAK classification. Only `peak-only`
+   * consumes it; every other mode leaves the free route independent of price.
+   *
+   * The answer is cached until the earlier of the owner's next transition and a
+   * short freshness window, so a policy edit or a missed reload cannot leave a
+   * stale classification for longer than a minute. No timer is created.
+   */
+  async refreshPricing(force = false): Promise<PricingSnapshot | undefined> {
+    if (this.#config.freeUsageMode !== "peak-only") return undefined;
+    const now = this.#clock.now();
+    if (!force && this.#pricing !== undefined && now < this.#pricingValidUntil) {
+      return this.#pricing;
+    }
+    if (this.#pricingRefresh !== undefined) return this.#pricingRefresh;
+
+    const fallback = this.#config.fallback;
+    const run = (async (): Promise<PricingSnapshot | undefined> => {
+      const answer =
+        fallback === undefined || this.#pricingPort === undefined
+          ? undefined
+          : await this.#pricingPort.evaluate({
+              providerID: fallback.providerID,
+              id: fallback.id,
+            });
+      const next: PricingSnapshot =
+        answer === undefined
+          ? {
+              state: "UNKNOWN",
+              allowed: false,
+              reason:
+                fallback === undefined
+                  ? "peak-only requires an explicit fallback model"
+                  : "the canonical opencode-offpeak pricing capability is unavailable",
+            }
+          : answer;
+      const previous = this.#pricing?.state;
+      this.#pricing = next;
+      const boundary = next.nextTransition;
+      this.#pricingValidUntil = Math.max(
+        now + 1_000,
+        Math.min(boundary === undefined ? now + 60_000 : boundary, now + 60_000),
+      );
+      if (previous !== next.state) {
+        this.#log("info", "free usage pricing changed", {
+          freeUsageMode: this.#config.freeUsageMode,
+          pricingState: next.state,
+          nextTransition: next.nextTransition,
+          policyID: next.policyID,
+        });
+      }
+      return next;
+    })();
+    this.#pricingRefresh = run;
+    try {
+      return await run;
+    } finally {
+      if (this.#pricingRefresh === run) this.#pricingRefresh = undefined;
+    }
+  }
+
+  /**
+   * The model new sessions should start on. In `peak-only` off-peak, that is
+   * the paid fallback; the free route is never published as the default when it
+   * is not eligible.
+   */
+  defaultTarget(): ModelRef {
+    if (
+      this.#config.freeUsageMode === "peak-only" &&
+      this.#pricingBlocksFree() &&
+      this.#config.fallback !== undefined
+    ) {
+      return this.#config.fallback;
+    }
+    return this.#config.primary;
+  }
+
   /** Clear any cooldown because an operator says the limit is lifted. */
   markHealthy(reason: string): void {
     this.#notePrimarySuccess(reason);
@@ -982,11 +1130,25 @@ export class FreeFirstEngine {
   status(): EngineStatus {
     const now = this.#clock.now();
     const fallbackSessionIds: string[] = [];
+    let primarySessions = 0;
     let manualOverrides = 0;
     for (const [sessionID, state] of this.#sessionsState) {
       if (state.managed && state.route === "FALLBACK") fallbackSessionIds.push(sessionID);
+      else if (state.managed && state.route === "PRIMARY") primarySessions += 1;
       if (state.optOut !== undefined) manualOverrides += 1;
     }
+    const activeRoute: EngineStatus["activeRoute"] =
+      !this.#enabled || this.#config.freeUsageMode === "off"
+        ? "NONE"
+        : primarySessions > 0 && fallbackSessionIds.length > 0
+          ? "MIXED"
+          : fallbackSessionIds.length > 0
+            ? "GO"
+            : primarySessions > 0
+              ? "FREE"
+              : this.#pricingBlocksFree() && this.#config.fallback !== undefined
+                ? "GO"
+                : "FREE";
     const nextProbeAt = this.#nextProbeAt();
     return {
       enabled: this.#enabled,
@@ -997,6 +1159,20 @@ export class FreeFirstEngine {
         this.#config.fallback === undefined
           ? "session-previous-or-default"
           : modelRefKey(this.#config.fallback),
+      freeUsageMode: this.#config.freeUsageMode,
+      ...(this.#config.freeUsageMode === "peak-only"
+        ? {
+            pricingState: this.#pricing?.state ?? ("UNKNOWN" as const),
+            ...(this.#pricing?.nextTransition === undefined
+              ? {}
+              : { pricingNextTransition: this.#pricing.nextTransition }),
+            ...(this.#pricing?.policyID === undefined
+              ? {}
+              : { pricingPolicyID: this.#pricing.policyID }),
+            ...(this.#pricing?.reason === undefined ? {} : { pricingReason: this.#pricing.reason }),
+          }
+        : {}),
+      activeRoute,
       cooldownMs: remainingCooldown(this.#health, now),
       ...(this.#health.cooldownUntil === undefined
         ? {}
@@ -1060,8 +1236,29 @@ export class FreeFirstEngine {
   /** One-line status suitable for a log line or a status widget. */
   statusLine(): string {
     if (!this.#enabled) return "disabled";
+    if (this.#config.freeUsageMode === "off") return "disabled (free usage mode off)";
     const heuristic = this.#sessionsState.size > 0 ? this.#config.primary : this.#config.primary;
     const state = healthState(this.#health, this.#clock.now());
+    if (this.#config.freeUsageMode === "peak-only") {
+      const pricing = this.#pricing?.state ?? "UNKNOWN";
+      if (pricing !== "PEAK") {
+        return `FREE policy: PEAK_ONLY | Pricing: ${pricing} | Active route: GO | Free preserved until PEAK`;
+      }
+      if (state === "FREE_HEALTHY") {
+        return `FREE policy: PEAK_ONLY | Pricing: PEAK | Active route: FREE (${modelRefKey(heuristic)})`;
+      }
+      const remaining = remainingCooldown(this.#health, this.#clock.now());
+      if (remaining > 0) {
+        if (this.#health.cooldownReason === "free-route") {
+          return `FREE policy: PEAK_ONLY | Pricing: PEAK | Active route: GO | Free route rejected (retry in ${formatDuration(remaining)})`;
+        }
+        if (this.#health.cooldownReason === "transient-availability") {
+          return `FREE policy: PEAK_ONLY | Pricing: PEAK | Active route: GO | Free transient provider failure (retry in ${formatDuration(remaining)})`;
+        }
+        return `FREE policy: PEAK_ONLY | Pricing: PEAK | Active route: GO | Free cooldown ${formatDuration(remaining)}`;
+      }
+      return "FREE policy: PEAK_ONLY | Pricing: PEAK | Active route: GO | probing FREE";
+    }
     if (state === "FREE_HEALTHY") return `FREE (${modelRefKey(heuristic)})`;
     const remaining = remainingCooldown(this.#health, this.#clock.now());
     if (remaining > 0) {
@@ -1079,7 +1276,26 @@ export class FreeFirstEngine {
   /* ------------------------------------------------------------- internals */
 
   #active(): boolean {
-    return this.#enabled && !this.#disposed;
+    return this.#enabled && this.#config.freeUsageMode !== "off" && !this.#disposed;
+  }
+
+  /**
+   * True when `peak-only` has no positive PEAK classification. `undefined`
+   * pricing is unknown, and unknown must never spend the free quota: only a
+   * verified PEAK window authorizes it.
+   */
+  #pricingBlocksFree(): boolean {
+    if (this.#config.freeUsageMode !== "peak-only") return false;
+    return this.#pricing?.state !== "PEAK";
+  }
+
+  #pricingAllowsFree(): boolean {
+    return !this.#pricingBlocksFree();
+  }
+
+  /** Both a live cooldown and an ineligible price state route to the fallback. */
+  #mustUseFallback(): boolean {
+    return this.#inCooldown() || this.#pricingBlocksFree();
   }
 
   #stateFor(sessionID: string): SessionState {
@@ -1175,7 +1391,7 @@ export class FreeFirstEngine {
    */
   async #enforceCooldownRouting(trigger: string): Promise<void> {
     if (!this.#active()) return;
-    if (!this.#inCooldown()) return;
+    if (!this.#mustUseFallback()) return;
     if (this.#cooldownRouting !== undefined) {
       // A pass is already running; it will run again to pick up anything that
       // appeared while it was working, including state it just learned.
@@ -1188,7 +1404,7 @@ export class FreeFirstEngine {
           this.#cooldownRoutingPending = false;
           this.#cooldownRoutingRuns += 1;
           for (const sessionID of [...this.#sessionsState.keys()]) {
-            if (!this.#active() || !this.#inCooldown()) return;
+            if (!this.#active() || !this.#mustUseFallback()) return;
             if (!this.#executing.has(sessionID)) continue;
             const state = await this.#stateWithModel(sessionID);
             if (state.optOut !== undefined) continue;
@@ -1201,7 +1417,7 @@ export class FreeFirstEngine {
             await this.#downgrade(sessionID, trigger);
             if (!wasFallback && state.route === "FALLBACK") this.#cooldownRoutedSessions += 1;
           }
-        } while (this.#cooldownRoutingPending && this.#active() && this.#inCooldown());
+        } while (this.#cooldownRoutingPending && this.#active() && this.#mustUseFallback());
       } finally {
         this.#cooldownRouting = undefined;
       }
@@ -1326,6 +1542,16 @@ export class FreeFirstEngine {
           cooldown: formatDuration(remainingCooldown(this.#health, now)),
         },
       );
+      return;
+    }
+    if (!this.#pricingAllowsFree()) {
+      // Off-peak: a refusal that was armed before the boundary must not pull
+      // the session back to a free route the policy has closed.
+      this.#pendingResumes.delete(input.sessionID);
+      this.#log("info", "refused fallback attempt stays on the paid route off-peak", {
+        sessionID: input.sessionID,
+        pricingState: this.#pricing?.state ?? "UNKNOWN",
+      });
       return;
     }
     this.#pendingResumes.delete(input.sessionID);
@@ -1667,6 +1893,7 @@ export class FreeFirstEngine {
   #nextProbeAt(): number | undefined {
     if (!this.#config.probe) return undefined;
     if (this.#health.state === "FREE_HEALTHY") return undefined;
+    if (!this.#pricingAllowsFree()) return undefined;
     return this.#health.cooldownUntil;
   }
 
@@ -1749,6 +1976,14 @@ export class FreeFirstEngine {
    */
   async #recovery(): Promise<void> {
     if (this.#probe !== undefined) return; // one probe decides for everyone
+    await this.refreshPricing();
+    if (this.#pricingBlocksFree()) {
+      // Off-peak: recovery must not consume the free route. Drop an elapsed
+      // cooldown without claiming a recovery and leave every session on Go.
+      this.#normaliseElapsedCooldown();
+      this.#schedule();
+      return;
+    }
     const waiting = this.#fallbackSessions();
     if (waiting.length === 0) {
       // The boundary is behind us and no session is waiting on the fallback, so
@@ -1845,6 +2080,12 @@ export class FreeFirstEngine {
    */
   async #runProbe(): Promise<ProbeOutcome> {
     await this.#adoptPersistedCooldown();
+    await this.refreshPricing();
+    if (this.#pricingBlocksFree()) {
+      this.#log("info", "recovery probe skipped: free is not eligible under the pricing policy");
+      this.#normaliseElapsedCooldown();
+      return "inconclusive";
+    }
     const now = this.#clock.now();
     if (inCooldown(this.#health, now)) {
       this.#log("info", "another free-first instance already holds a cooldown; skipping the probe");
@@ -1974,8 +2215,9 @@ export class FreeFirstEngine {
   async #preemptParkedSessions(): Promise<void> {
     if (!this.#config.parkPreemption) return;
     // Preemption re-interrupts an active execution, so it only happens once the
-    // free model is confirmed usable: never on a guess.
+    // free model is confirmed usable: never on a guess, and never off-peak.
     if (this.#health.state !== "FREE_HEALTHY") return;
+    if (!this.#pricingAllowsFree()) return;
     const now = this.#clock.now();
     for (const [sessionID, mark] of [...this.#prepared]) {
       if (mark.dispatched) continue;

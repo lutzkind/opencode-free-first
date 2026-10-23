@@ -24,7 +24,12 @@ import { resolveConfig } from "./config.js";
 import type { Clock, ExecutionEvent, RetryInput, StateStore } from "./engine.js";
 import { FreeFirstEngine } from "./engine.js";
 import { createLogger } from "./log.js";
-import { createPaidHoldPort, OFFPEAK_CANCEL_HOLD_RPC } from "./offpeak.js";
+import {
+  createPaidHoldPort,
+  createPricingPort,
+  OFFPEAK_CANCEL_HOLD_RPC,
+  OFFPEAK_PRICING_RPC,
+} from "./offpeak.js";
 import type { FreeFirstRpcInput, FreeFirstRpcOutput } from "./rpc.js";
 import { FREE_FIRST_RPC, FREE_FIRST_USAGE } from "./rpc.js";
 import type { ModelRef } from "./types.js";
@@ -115,12 +120,28 @@ export default Plugin.define({
           )
         : undefined;
 
+    // The canonical pricing classification. It is owned by opencode-offpeak;
+    // this plugin only consumes it, and only when `peak-only` is configured.
+    const pricing =
+      config.freeUsageMode === "peak-only" && resolved.error === undefined
+        ? createPricingPort(
+            (input) => context.rpc(OFFPEAK_PRICING_RPC).pricing({ ...input }),
+            (error) => {
+              logger.error(
+                "opencode-offpeak pricing capability is unavailable; peak-only cannot confirm PEAK",
+                { detail: error instanceof Error ? error.message : String(error) },
+              );
+            },
+          )
+        : undefined;
+
     engine = new FreeFirstEngine({
       config,
       clock,
       storage,
       logger,
       ...(paidHolds === undefined ? {} : { paidHolds }),
+      ...(pricing === undefined ? {} : { pricing }),
       random: Math.random,
       onError: (error) => {
         logger.error("background failure", {
@@ -177,6 +198,17 @@ export default Plugin.define({
 
     const registrations: Array<{ dispose: () => Promise<void> }> = [];
 
+    // Resolve the canonical pricing classification before publishing a default,
+    // so an off-peak start never advertises the free route.
+    if (config.freeUsageMode === "peak-only" && resolved.error === undefined) {
+      const snapshot = await engine.refreshPricing(true);
+      logger.info("free usage policy resolved", {
+        freeUsageMode: config.freeUsageMode,
+        pricingState: snapshot?.state ?? "UNKNOWN",
+        nextTransition: snapshot?.nextTransition,
+      });
+    }
+
     /* ------------------------------------------------- default + variants */
 
     const transform = await context.model.transform((editor) => {
@@ -197,18 +229,27 @@ export default Plugin.define({
       if (
         currentProvider !== undefined &&
         currentModel !== undefined &&
-        !(currentProvider === config.primary.providerID && currentModel === config.primary.id)
+        !(currentProvider === config.primary.providerID && currentModel === config.primary.id) &&
+        !(
+          config.fallback !== undefined &&
+          currentProvider === config.fallback.providerID &&
+          currentModel === config.fallback.id
+        )
       ) {
         engine.rememberDefault({ providerID: currentProvider, id: currentModel });
       }
       if (config.enabled && config.preferAsDefault) {
-        const target = editor.get(config.primary.providerID, config.primary.id);
+        const preferred = engine.defaultTarget();
+        const target = editor.get(preferred.providerID, preferred.id);
         if (target === undefined) {
-          logger.error("primary model is not available; leaving the default selection unchanged", {
-            primary: modelRefKey(config.primary),
-          });
+          logger.error(
+            "preferred model is not available; leaving the default selection unchanged",
+            {
+              preferred: modelRefKey(preferred),
+            },
+          );
         } else {
-          editor.default.set(config.primary.providerID, config.primary.id);
+          editor.default.set(preferred.providerID, preferred.id);
         }
       }
     });

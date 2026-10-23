@@ -43,6 +43,7 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | Option | Default | Notes |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. `off` disables every routing decision, timer, and probe, and preserves persisted cooldown state. |
+| `freeUsageMode` | `"always-free-first"` | `always-free-first` preserves the historical behaviour. `peak-only` spends Free only in a verified PEAK window reported by `opencode-offpeak`; it requires an explicit `fallback` and routes off-peak/weekend/holiday traffic to Go with no Free request or probe. `off` disables free-first routing. Invalid values fail visibly. |
 | `preferAsDefault` | `true` | Publish `primary` as OpenCode's default model selection, so new sessions start on the free model. |
 | `adoptFallbackSessions` | `false` | Also manage sessions whose model is the configured `fallback`, returning them to the free model when it is usable. Leave off unless you want free-first to move sessions you left on a paid route. |
 | `respectExplicitModelSelection` | `true` | Stop managing a session when you pick another model by hand. With `false`, a manual switch to the paid route keeps the session managed. |
@@ -51,6 +52,19 @@ so a switch does not silently reset the user's reasoning-effort setting.
 | `parkPreemption` | `true` | Reclaim a fallback request parked by another plugin's pre-model hold once the free model is confirmed healthy. |
 | `cooldownScope` | `"shared"` | `"shared"` keeps one cooldown for the whole OpenCode instance (a free tier is normally per account, and this also prevents probe storms). `"session"` limits per session. |
 | `sessionLimit` | `200` | Upper bound on remembered sessions; the least recently updated are evicted. |
+
+## Free usage mode
+
+`peak-only` never embeds a schedule. It calls the canonical read-only `pricing`
+RPC on `opencode-offpeak` for the configured fallback and caches the answer only
+until the earlier of the reported `nextTransition` and a 60-second freshness
+window. `PEAK` is the only state that authorizes Free. `OFF_PEAK`, `FLAT`,
+`UNTRACKED`, `UNKNOWN`, a missing plugin, or a failed RPC all keep Free closed,
+so an uncertain pricing state cannot spend free quota.
+
+The mode is evaluated at prompt admission, request preparation, retry, recovery,
+and probe dispatch — the safe boundaries OpenCode already provides. No timer,
+scheduler, daemon, or second calendar is created.
 
 ## Timing
 
