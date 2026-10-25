@@ -98,6 +98,13 @@ required; the suite uses `opencode run --standalone` and
 | 14 — auth failure | Stops visibly; no paid request |
 | 15 — provider 500 | The same turn continues on the fallback; the paid continuation carries the same conversation and tool set; no duplicated prompt; one session |
 | 16 — outage clears | Automatic recovery returns the session to free; the status names the transient cause, no rate-limit metadata invented |
+| 22 — live free title gate | The free primary supplies the first-prompt title without a tool-less provider request; one tool-bearing request upgrades it; exactly one title request; no duplicate user message or answer |
+| 23 — failing free title | A free 429 fails the main turn over normally and the title falls back to the normalized first prompt without a provider request |
+| 24 — paid title | A session pinned to the paid model keeps OpenCode's native title request; the free-only hook does not replace it |
+| 25 — manual rename race | A manual rename wins against the settled-turn title upgrade and is never overwritten |
+| 26 — previously untitled | A legacy untitled session receives a durable title on its next message |
+| 27 — peak-only off-peak | Peak Only off-peak makes no free title request and leaves the paid session's native title path alone |
+| 28 — restart | A durable title survives a server restart and is not regenerated |
 
 Useful environment variables:
 
@@ -107,6 +114,17 @@ Useful environment variables:
 | `FF_OPENCODE=/path/to/opencode` | Use a specific CLI binary |
 | `FF_OFFPEAK_SPEC=<spec>` | Install a different `opencode-offpeak` version |
 | `FF_TUI_SMOKE=1` | Enable the real-TUI suite (`npm run test:tui`) |
+
+## Automatic session naming gate — `npm run test:title`
+
+Runs the hermetic title unit suite and the real-CLI title cases 22–28 only. It
+is the focused release gate for automatic naming and prints the exact package
+version in npm's run banner. A release is not complete until it passes and the
+resulting version and commit are recorded with the release evidence.
+
+```sh
+npm run test:title
+```
 
 ## Real TUI — `npm run test:tui`
 

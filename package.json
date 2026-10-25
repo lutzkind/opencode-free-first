@@ -58,6 +58,7 @@
     "test": "npm run compile && node --test test/*.test.mjs",
     "check": "npm run lint && npm run typecheck && npm test",
     "test:integration": "npm run compile && FF_INTEGRATION=1 node --test test/integration.test.mjs",
+    "test:title": "npm run compile && node --test test/title.test.mjs && FF_INTEGRATION=1 node --test --test-name-pattern='Case 2[2-8] —' test/integration.test.mjs",
     "test:offpeak-regression": "node scripts/offpeak-regression.mjs",
     "test:tui": "npm run compile && FF_TUI_SMOKE=1 node --test test/tui-smoke.test.mjs"
   },

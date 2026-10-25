@@ -22,15 +22,19 @@ registry publication is required for this release to be installed or used.
 
 1. `npm run check` — lint, typecheck, unit tests.
 2. `npm run test:integration` — real CLI plus the real `opencode-offpeak`.
-3. `npm run test:offpeak-regression` — the neighbour plugin's own checks.
-4. `npm run test:tui` — real TUI on the current binary (tmux, opt-in).
-5. `npm pack --dry-run` — confirm the file list has no development or machine
+3. `npm run test:title` — the automatic session naming release gate. It runs
+   the title unit suite and the real-CLI title cases 22–28, and npm prints the
+   exact plugin version (`opencode-free-first@X.Y.Z`) in its run banner. Record
+   that version with the release evidence.
+4. `npm run test:offpeak-regression` — the neighbour plugin's own checks.
+5. `npm run test:tui` — real TUI on the current binary (tmux, opt-in).
+6. `npm pack --dry-run` — confirm the file list has no development or machine
    files and includes `tui.ts` and `dist/tui.js`.
-6. Confirm `package.json` `version` matches the intended tag.
-7. Update `CHANGELOG.md` with the release date and a link to the tag.
-8. Commit, tag `vX.Y.Z`, push the branch and the tag.
-9. Create the GitHub release from the tag with the changelog entry as the body.
-10. Verify the exact-tag install in a scratch OpenCode home, including the TUI
+7. Confirm `package.json` `version` matches the intended tag.
+8. Update `CHANGELOG.md` with the release date and a link to the tag.
+9. Commit, tag `vX.Y.Z`, push the branch and the tag.
+10. Create the GitHub release from the tag with the changelog entry as the body.
+11. Verify the exact-tag install in a scratch OpenCode home, including the TUI
     entry (`/free-first status`), and check that the saved mode starts from the
     configured `freeUsageMode`:
 
@@ -42,7 +46,13 @@ registry publication is required for this release to be installed or used.
    XDG_CACHE_HOME=/tmp/verify-cache opencode plugin list
    ```
 
-11. Record the verification, including the loaded entrypoint path and the TUI
+12. In that scratch home, create a fresh free-primary session, send one prompt,
+    and read the durable session title back through the supported session API.
+    The release fails verification if the title is empty, the exact timestamped
+    creation fallback, or a manual rename was overwritten. Record the exact
+    installed plugin version and commit next to the title result.
+
+13. Record the verification, including the loaded entrypoint path and the TUI
     version, in the release notes or the project handoff.
 
 ## Compatibility gate
