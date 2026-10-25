@@ -19,8 +19,9 @@ scheduler for paid work, no daemon, and no second database.
 Compatibility: the package declares and tests OpenCode `>=2.0.26 <2.2.0`. The
 current production binary is 2.1.3. OpenCode 2.1's breaking session-schema change
 (`providerState` → `native`) does not touch the hooks used here; its new internal
-retry of buffered model calls only delays a refused recovery probe until the
-bounded retry schedule finishes. The real-CLI coexistence suite runs on 2.1.3, and the new CLI control surface is
+retry of buffered model calls only delays a refused recovery probe (and a title
+generation request that hits a retryable outage) until the bounded retry schedule
+finishes. The real-CLI coexistence suite runs on 2.1.3, and the new CLI control surface is
 verified on the same binary through a real tmux-driven TUI test (native
 `keymap.layer`, `ui.dialog.select`, and `client.rpc`; no undocumented runtime
 behaviour).
@@ -217,7 +218,9 @@ cannot move a session the user repointed while OpenCode was stopped.
 | `http.response` | Prove free health from a non-error response that was dispatched while Free was eligible and no recovery probe was in flight; capture reset headers. Concurrent OpenCode 2.1 title/auxiliary requests cannot clear a real cooldown or overtake a probe. |
 | `retry` | The failover decision: record the cooldown (`rate-limit`, `free-route`, or `transient-availability`), switch the model, force one cheap retry. Anything else stays visible. |
 | `generate` | Bound the recovery probe's output while it is in flight. |
-| `event.subscribe` | `session.execution.started|succeeded|failed|interrupted` and `session.model.selected`. |
+| `title` | On the configured free primary only: supply the normalized first user prompt immediately (no provider request), so OpenCode's tool-less free-title request is never sent. Other models keep the native path. |
+| `http.response` (unscoped) | If a native title request on a non-free route fails, write the first-prompt fallback through the supported session API. Inert for every other request kind. |
+| `event.subscribe` | `session.execution.started|succeeded|failed|interrupted` and `session.model.selected`. A successful settle is the boundary where a first-prompt title may be upgraded. |
 | `rpc.register` | Diagnostics and operator controls, including the current mode, pricing state, next transition, and active route. Changing the mode also rebuilds this location's model defaults through `model.reload`, and emits the portable `transition` event so other locations adopt the same saved mode. |
 | CLI `keymap.layer` (`src/tui.ts`) | Native `/free-first`, `/free-first status`, and `/free-first mode …` slash commands, plus a native selector. It stores nothing; every read and write goes through the control RPC. |
 
@@ -368,6 +371,60 @@ Passive recovery (probing disabled, or no session to recover) moves waiting
 sessions back to the free model at a safe boundary and lets real traffic confirm
 recovery. That is the cheapest correct path when the session is already going to
 make a call.
+
+## Titles
+
+OpenCode 2.1 generates a session's automatic title on a separate, **tool-less**
+request (`packages/core/src/session/title.ts`). OpenCode's own free tier refuses
+that maintenance shape with `403 FreeTierError` while the normal tool-bearing
+request on the same model succeeds (upstream issue
+[anomalyco/opencode#58176](https://github.com/anomalyco/opencode/issues/58176)).
+`SessionTitle.attempt` marks the attempt failed and returns, so neither the
+retry/failover hook nor any client sees the failure and the session stays
+untitled after a completely successful turn.
+
+The repair stays inside the existing plugin and the supported session APIs:
+
+```
+title hook (free primary only)
+  │ first user message (supported session.context)
+  ▼
+normalized, 100-character first-prompt title   ← no provider request
+  │ stored by OpenCode through its own rename sequence guard
+  ▼
+turn settles (session.execution.succeeded)
+  │
+  ├── session still exactly on that fallback?
+  │      │ yes
+  │      ▼
+  │   one tool-bearing ctx.session.generate on the free primary
+  │      │ success → rename to the generated title (re-checked first)
+  │      │ failure → keep the useful fallback
+  │
+  └── manual rename / other title → forget the fallback, never overwrite
+```
+
+- The replacement request is `session.generate`: the same stateless,
+  session-context, tool-bearing shape OpenCode already serves for `/generate`.
+  It does not mutate the session, add a user message, run a tool, or create a
+  second session.
+- It only runs while the session's current model is the configured **free
+  primary** and `freeRouteSpendable()` is true, so it uses the existing
+  health/price gate and cannot create paid title traffic. During a cooldown or a
+  `peak-only` off-peak window the fallback title stays.
+- Title failures are classified for diagnostics only. They are never fed into
+  `onRetry` or the health record, so a title-shaped failure cannot arm a
+  cooldown or be presented as free exhaustion.
+- The native title path is untouched for every non-free model. A failed native
+  title on such a route is observed at `http.response` and named from the first
+  prompt through `session.update`, which is the smallest deterministic fallback.
+- The fallback record is in memory, bounded to the 100 most recent sessions.
+  After a restart a fallback title remains durable and useful; it simply cannot
+  be upgraded until the next prompt, when the normal prompt boundary re-arms it.
+- Removal is one hook registration plus `src/title.ts`; no core patch, fork,
+  daemon, queue, database, scheduler, or second title subsystem exists. When
+  upstream ships a release where the free route accepts its own title request,
+  delete the `title` hook and the module.
 
 ## Compaction
 

@@ -2,11 +2,11 @@
 
 ## Current public distribution
 
-`v0.3.0` is the canonical release and is installable from its exact GitHub tag
+`v0.4.0` is the canonical release and is installable from its exact GitHub tag
 with OpenCode CLI v2:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.3.0
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.4.0
 ```
 
 The release includes the server plugin and its native CLI (TUI) companion. The

@@ -80,11 +80,14 @@ A *generic* 401 or 403 (an invalid API key, a forbidden account, a malformed
 request) is deliberately **not** this. Those stay visible, the plugin does not
 fail over, and the underlying error is surfaced unchanged.
 
-Note that a session's automatic *title* request is not covered by the retry hook:
-OpenCode generates titles on its own path and swallows failures there, so a gate
-that happens to hit only the title request leaves the title missing and the turn
-runs normally. The failover covers the agent loop and compaction requests, which
-are the requests that carry the turn.
+A session's automatic *title* request is handled separately, because OpenCode
+runs it as a tool-less maintenance request that the free tier can refuse even
+when the turn succeeds. Since v0.4.0 the plugin supplies the normalized first
+prompt as the title immediately (no provider request), then replaces it with one
+generated title after the turn settles, on the free route only. `/free-first
+status` reports a `titles` block with the attempt/fallback/generated counters, and
+the log line names the request kind, model, outcome, and classified failure. The
+turn itself is never affected by a title failure.
 
 ## A provider 500 (or 502/503/504, or a transport failure) killed the turn
 

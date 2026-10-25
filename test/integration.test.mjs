@@ -81,12 +81,13 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
   });
 
   /** The whole OpenCode configuration, so a case can swap the plugin list. */
-  function writeConfig(plugins) {
+  function writeConfig(plugins, extra = {}) {
     writeJson(path.join(home, "config", "opencode", "opencode.json"), {
       $schema: "https://opencode.ai/config.json",
       permissions: [{ action: "*", resource: "*", effect: "allow" }],
       websearch: false,
       model: "ffmock/ff-free",
+      ...extra,
       plugins,
       providers: {
         ffmock: {
@@ -150,6 +151,10 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       delayMs: 0,
       gateProbe: false,
       onlyWithTools: false,
+      toolLessOnly: false,
+      // The title shim is not the subject of the routing cases: keep its
+      // replacement request out of their counters and error modes.
+      ignoreTitleReplacement: true,
     };
     await fetch(`http://127.0.0.1:${port}/__control`, {
       method: "POST",
@@ -157,6 +162,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
       body: JSON.stringify({
         log: patch.log ?? [],
         resetCounters: true,
+        failTitleReplacement: patch.failTitleReplacement ?? false,
         free: { ...baseline, ...(patch.free ?? {}) },
         paid: { ...baseline, ...(patch.paid ?? {}) },
       }),
@@ -318,7 +324,7 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     const result = await run("Reply with the word READY");
     assertOk(result);
     const state = await mockState();
-    assert.deepEqual(models(state), ["ff-free", "ff-free"], "only the free model was used");
+    assert.deepEqual(models(state), ["ff-free"], "only the free model served the turn");
     assert.match(result.stdout, /MOCK_OK model=ff-free/);
     assert.doesNotMatch(result.stdout, /fallback selected/);
     assert.doesNotMatch(result.stdout, /free rate limit detected/);
@@ -1620,6 +1626,326 @@ describe("live coexistence with opencode-offpeak", { skip: !ENABLED }, () => {
     assert.match(allowed.stdout, /MOCK_OK model=ff-paid/);
     writeConfig(coexistencePlugins);
     offpeakConfig(undefined);
+  });
+  /* ---------------------------------------------------------------- titles */
+
+  /**
+   * Wait for the durable session row to satisfy `predicate`. Titles are a
+   * forked background request, so a test must read the stored title, not the
+   * streaming transcript.
+   */
+  async function waitForSession(call, sessionID, predicate, label) {
+    let last;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      last = (await call("GET", `/api/session/${sessionID}`))?.data;
+      if (last !== undefined && predicate(last)) return last;
+    }
+    throw new Error(`timed out waiting for ${label}: ${JSON.stringify(last)}`);
+  }
+
+  const titled = (session) => typeof session?.title === "string" && session.title.length > 0;
+  const userMessages = (messages) => messages.filter((message) => message.type === "user");
+  const answered = (messages) =>
+    messages.filter(
+      (message) =>
+        message.type === "assistant" &&
+        (message.content ?? []).some(
+          (part) => part.type === "text" && String(part.text ?? "").includes("MOCK_OK"),
+        ),
+    );
+
+  it("Case 22 — the live free tool-less title gate: the turn is titled by the replacement request", async () => {
+    // anomalyco/opencode#58176: the normal tool-bearing request succeeds while
+    // the tool-less automatic title request is refused with 403 FreeTierError.
+    // The session must still receive a durable, generated title, and OpenCode's
+    // doomed native title request must not be sent at all.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: {
+        mode: "free-tier-gate",
+        toolLessOnly: true,
+        delayMs: 300,
+        ignoreTitleReplacement: false,
+      },
+      paid: { mode: "ok" },
+    });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      assert.ok(sessionID, `no session id: ${JSON.stringify(created)}`);
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Fix the failing deployment pipeline",
+      });
+      const session = await waitForSession(
+        call,
+        sessionID,
+        (candidate) => candidate.title === "Deploy pipeline repair",
+        "the generated title",
+      );
+      const messages = (await call("GET", `/api/session/${sessionID}/context`))?.data ?? [];
+      return { session, messages, sessionID };
+    });
+
+    assert.equal(outcome.session.title, "Deploy pipeline repair");
+    assert.equal(userMessages(outcome.messages).length, 1, "the prompt was never duplicated");
+    assert.equal(answered(outcome.messages).length, 1, "the turn was answered exactly once");
+
+    const state = await mockState();
+    const requests = state.log.filter(
+      (entry) => entry.event === "request" && entry.role === "free",
+    );
+    const replacements = requests.filter((entry) => entry.titleReplacement === true);
+    assert.equal(replacements.length, 1, "exactly one replacement title request");
+    assert.ok((replacements[0].tools ?? 0) > 0, "the replacement request carries tools");
+    assert.equal(
+      requests.filter((entry) => (entry.tools ?? 0) === 0).length,
+      0,
+      "the native tool-less title request never ran",
+    );
+    assert.equal(
+      state.log.filter((entry) => entry.event === "error-response").length,
+      0,
+      "no request was refused",
+    );
+  });
+
+  it("Case 23 — a failing free title still yields a deterministic first-prompt title", async () => {
+    // Free is exhausted: the main turn fails over and answers on the fallback
+    // (existing semantics untouched), while the title falls back to the first
+    // prompt instead of staying empty.
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "429", retryAfterSeconds: 120, ignoreTitleReplacement: false },
+      paid: { mode: "ok" },
+      failTitleReplacement: true,
+    });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with exactly: hi",
+      });
+      const title = await waitForSession(call, sessionID, titled, "the fallback title");
+      const settled = await waitForSession(
+        call,
+        sessionID,
+        (candidate) => candidate.outcome === "succeeded",
+        "the settled turn",
+      );
+      const messages = (await call("GET", `/api/session/${sessionID}/context`))?.data ?? [];
+      return { title, messages, session: settled };
+    });
+
+    assert.equal(outcome.title.title, "Reply with exactly: hi");
+    assert.equal(userMessages(outcome.messages).length, 1, "the prompt was never duplicated");
+    assert.equal(answered(outcome.messages).length, 1, "the turn was answered exactly once");
+    assert.match(
+      answered(outcome.messages)[0]
+        .content.map((part) => part.text ?? "")
+        .join(""),
+      /MOCK_OK model=ff-paid/,
+    );
+
+    const state = await mockState();
+    assert.ok(
+      state.log.some((entry) => entry.event === "error-response" && entry.status === 429),
+      "the free route really refused the requests",
+    );
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.titleReplacement === true)
+        .length,
+      0,
+      "the free title hook never opened a provider request",
+    );
+  });
+
+  it("Case 24 — a paid session keeps OpenCode's native title path", async () => {
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "ok" },
+      paid: { mode: "ok" },
+      failTitleReplacement: false,
+    });
+    // Pin the title agent to the paid model, as production's Go route does for
+    // a fallback session; the free-only shim must stay out of the way.
+    writeConfig(coexistencePlugins, {
+      agents: { title: { model: { providerID: "ffmock", model: "ff-paid" } } },
+    });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        model: { providerID: "ffmock", id: "ff-paid" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with exactly: hi",
+      });
+      const title = await waitForSession(call, sessionID, titled, "the native title");
+      return { title };
+    });
+
+    assert.equal(outcome.title.title, "MOCK_OK model=ff-paid");
+    const state = await mockState();
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.titleReplacement === true)
+        .length,
+      0,
+      "the free-only shim never replaced a paid title",
+    );
+    assert.ok(
+      state.log.some(
+        (entry) => entry.event === "request" && entry.role === "paid" && (entry.tools ?? 0) === 0,
+      ),
+      "OpenCode's native tool-less title request ran",
+    );
+  });
+
+  it("Case 25 — a manual rename wins the race against automatic naming", async () => {
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      // Keep the replacement generation in flight long enough to rename first.
+      free: { mode: "ok", delayMs: 1_500, ignoreTitleReplacement: false },
+      paid: { mode: "ok" },
+    });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Fix the failing deployment pipeline",
+      });
+      await call("PATCH", `/api/session/${sessionID}`, { title: "Manual operator title" });
+      // Give the automatic attempt time to finish and (must not) overwrite.
+      await new Promise((resolve) => setTimeout(resolve, 8_000));
+      return (await call("GET", `/api/session/${sessionID}`))?.data;
+    });
+
+    assert.equal(outcome?.title, "Manual operator title");
+  });
+
+  it("Case 26 — a previously untitled session is titled on its next message", async () => {
+    offpeakConfig(undefined);
+    reset();
+    await control({
+      log: [],
+      free: { mode: "ok", ignoreTitleReplacement: false },
+      paid: { mode: "ok" },
+    });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      // Admit a first message without executing the turn: the durable session
+      // stays untitled, which is the legacy state left by the old defect.
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Fix the failing deployment pipeline",
+        resume: false,
+      });
+      const before = (await call("GET", `/api/session/${sessionID}`))?.data;
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with exactly: hi",
+      });
+      const title = await waitForSession(call, sessionID, titled, "the recovered title");
+      return { before, title };
+    });
+
+    assert.ok(!titled(outcome.before), "the session really started untitled");
+    assert.ok(titled(outcome.title), "the next message produced a durable title");
+  });
+
+  it("Case 27 — peak-only OFF_PEAK makes no free title request", async () => {
+    // The title shim must obey the same price gate as the router: off-peak it
+    // spends nothing on Free, and the paid session keeps its native title.
+    writePeakOnlyConfig();
+    offpeakConfig(flatPolicy());
+    reset();
+    await control({ log: [], free: { mode: "ok" }, paid: { mode: "ok" } });
+
+    const outcome = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Reply with exactly: hi",
+      });
+      const title = await waitForSession(call, sessionID, titled, "the title");
+      return title;
+    });
+
+    assert.ok(titled(outcome));
+    const state = await mockState();
+    assert.equal(
+      state.log.filter((entry) => entry.event === "request" && entry.role === "free").length,
+      0,
+      "peak-only off-peak never touched Free, including the title",
+    );
+    writeConfig(coexistencePlugins);
+  });
+
+  it("Case 28 — a server restart keeps the durable title and does not regenerate it", async () => {
+    offpeakConfig(undefined);
+    reset();
+    await control({ log: [], free: { mode: "ok" }, paid: { mode: "ok" } });
+
+    const first = await withServer(async ({ call }) => {
+      const created = await call("POST", "/api/session", {
+        model: { providerID: "ffmock", id: "ff-free" },
+        location: { directory: path.join(home, "project") },
+      });
+      const sessionID = created?.id ?? created?.data?.id;
+      await call("POST", `/api/session/${sessionID}/prompt`, {
+        text: "Fix the failing deployment pipeline",
+      });
+      const title = await waitForSession(call, sessionID, titled, "the first title");
+      return { sessionID, title: title.title };
+    });
+
+    const second = await withServer(async ({ call }) => {
+      await call("POST", `/api/session/${first.sessionID}/prompt`, {
+        text: "Reply with exactly: hi",
+      });
+      const messages = [];
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        messages.splice(
+          0,
+          messages.length,
+          ...((await call("GET", `/api/session/${first.sessionID}/context`))?.data ?? []),
+        );
+        if (answered(messages).length >= 2) break;
+      }
+      const title = (await call("GET", `/api/session/${first.sessionID}`))?.data;
+      return { title, messages };
+    });
+
+    assert.equal(second.title?.title, first.title);
+    assert.equal(userMessages(second.messages).length, 2, "each user message is durable once");
   });
 });
 

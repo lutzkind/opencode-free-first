@@ -3,6 +3,42 @@
 Notable changes. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-10-25
+
+### Added
+
+- **Automatic titles survive OpenCode's free-tier title gate.** OpenCode 2.1's
+  automatic title request is tool-less, and the free tier refuses that shape
+  with `403 FreeTierError` while the normal agent request succeeds
+  ([anomalyco/opencode#58176](https://github.com/anomalyco/opencode/issues/58176)).
+  On the configured free primary model the `title` hook now supplies the
+  normalized first user prompt immediately, with no provider request, so a
+  successful turn is never left unnamed. Once the turn settles, one supported
+  tool-bearing `session.generate` request replaces that fallback with a generated
+  title, mirroring upstream PR #57624's "prompt title is still eligible" rule.
+- **Deterministic fallback for failed native titles.** A failed native title
+  request on a paid route is observed at `http.response` and named from the first
+  prompt through the supported session API instead of being swallowed.
+- **Bounded title diagnostics.** `status` reports a `titles` block (`attempted`,
+  `fallback`, `generated`, `delegated`, `skipped`, `failed`), and every attempt
+  logs its outcome, request kind, provider/model, and classified failure. Prompts,
+  credentials, and provider secrets are never logged.
+
+### Changed
+
+- The compatibility repair is scoped to the configured free primary. Every other
+  model keeps OpenCode's native title path.
+- Upgrade generation only runs while the session is back on the free primary and
+  the router would spend free quota, so no paid title traffic is created. It is
+  bounded to three attempts, re-checks the stored title immediately before
+  renaming, and never overwrites a manual rename.
+
+### Notes
+
+- The workaround is removable by deleting the `title` hook registration once
+  upstream titles work on the free route. OpenCode v2.1.4 is tagged upstream but
+  not released and does not contain the fix; PR #57624 is still open.
+
 ## [0.3.0] — 2026-10-23
 
 ### Added
