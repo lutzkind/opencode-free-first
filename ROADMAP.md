@@ -5,6 +5,13 @@ it, so each item needs evidence before it is implemented.
 
 ## Recently closed
 
+- **Free-route automatic titles (v0.4.0).** Closed with a free-primary `title`
+  hook that supplies the normalized first prompt (no provider request), one
+  settled tool-bearing `session.generate` upgrade that mirrors upstream PR
+  #57624, a deterministic fallback for failed native titles, and a `titles`
+  status block. Scoped to the free primary; every other model keeps the native
+  path. Remove the hook when upstream ships the fix (#57624, #58176).
+
 - **In-TUI mode control (v0.3.0).** Closed with a native CLI companion
   (`./tui`): `/free-first`, `/free-first status`, `/free-first mode
   free-first|peak-only|disabled`, and a native selector. The choice is persisted
@@ -46,6 +53,10 @@ it, so each item needs evidence before it is implemented.
   fixtures, when a provider is observed to use them.
 - **Session-scoped persistence pruning.** Drop persisted session hints when the
   session no longer exists, if OpenCode exposes a cheap existence check.
+
+- **Delete the title compatibility shim** once a supported OpenCode release makes
+  the free route accept its own tool-less title request or ships PR #57624.
+  Re-test the free gate first; do not assume the request shape is fixed.
 
 ## Explicitly out of scope
 

@@ -9,7 +9,12 @@
  *  - `context`          observes request preparation (park detection) and
  *                       performs passive recovery at a safe boundary.
  *  - `model.request`    confirms a request is about to be dispatched.
- *  - `http.response`    proves free health and captures reset metadata.
+ *  - `title`            replaces OpenCode's tool-less free-title request with a
+ *                       supported tool-bearing session generation, and falls
+ *                       back to the first prompt when generation cannot run.
+ *  - `http.response`    proves free health and captures reset metadata, and
+ *                       writes the first-prompt fallback for a failed native
+ *                       title on a non-free route.
  *  - `retry`            fails the same session over to the fallback model on a
  *                       genuine free-model rate limit.
  *  - `generate`         bounds the recovery probe's output.
@@ -32,6 +37,7 @@ import {
 } from "./offpeak.js";
 import type { FreeFirstRpcOutput } from "./rpc.js";
 import { FREE_FIRST_RPC, handleFreeFirstControl } from "./rpc.js";
+import { TitleCompatibility } from "./title.js";
 import type { ModelRef } from "./types.js";
 import { modelRefKey } from "./types.js";
 
@@ -89,6 +95,11 @@ export default Plugin.define({
     // `generate` hook can bound the probe's output without touching any other
     // caller's settings.
     let probing = false;
+    // Sessions with a title-compatibility generation in flight. The request is
+    // stateless and must not be mistaken for agent-loop routing evidence: it can
+    // resolve the session's model just before a failover and would otherwise
+    // produce a spurious post-cooldown routing pass.
+    const titleGenerating = new Set<string>();
 
     const modelIsPrimary = (model: { providerID: string; id: string } | undefined): boolean =>
       model !== undefined &&
@@ -207,6 +218,69 @@ export default Plugin.define({
 
     const registrations: Array<{ dispose: () => Promise<void> }> = [];
 
+    /* -------------------------------------------------------- titles */
+
+    // OpenCode's own automatic title request is tool-less, and its free tier
+    // rejects that shape before the plugin retry hook exists. The shim replaces
+    // it only on the configured free primary model and only with supported
+    // session APIs; every other model keeps OpenCode's native title path.
+    const titles = new TitleCompatibility({
+      primary: config.primary,
+      logger,
+      routing: { freeRouteSpendable: () => engine.freeRouteSpendable() },
+      sessions: {
+        firstUserText: async (sessionID) => {
+          const messages = await context.session.context({ sessionID: sessionID as never });
+          for (const message of messages as ReadonlyArray<{ type?: string; text?: string }>) {
+            if (message.type === "user" && typeof message.text === "string") return message.text;
+          }
+          return undefined;
+        },
+        generate: async (input) => {
+          titleGenerating.add(input.sessionID);
+          try {
+            const result = await context.session.generate({
+              sessionID: input.sessionID as never,
+              prompt: input.prompt,
+            });
+            return { text: typeof result?.text === "string" ? result.text : "" };
+          } finally {
+            titleGenerating.delete(input.sessionID);
+          }
+        },
+        get: async (input) => {
+          const session = (await context.session.get({
+            sessionID: input.sessionID as never,
+          })) as {
+            title?: string;
+            parentID?: string;
+            model?: { providerID: string; id: string; variant?: string };
+          };
+          return {
+            ...(session.title === undefined ? {} : { title: session.title }),
+            ...(session.parentID === undefined ? {} : { parentID: session.parentID }),
+            ...(session.model === undefined
+              ? {}
+              : {
+                  model: {
+                    providerID: session.model.providerID,
+                    id: session.model.id,
+                    ...(session.model.variant === undefined
+                      ? {}
+                      : { variant: session.model.variant }),
+                  },
+                }),
+          };
+        },
+        rename: async (input) => {
+          await context.session.update({
+            sessionID: input.sessionID as never,
+            title: input.title,
+          });
+        },
+      },
+    });
+
     // Restore persisted derived state first: a mode saved from the TUI must
     // decide the initial pricing query and the published default model.
     await engine.start();
@@ -281,8 +355,29 @@ export default Plugin.define({
         if (!config.enabled) return;
         try {
           await engine.onPrompt(String(event.sessionID));
+          // A first-prompt fallback written after an earlier free failure may be
+          // replaced by a real title once the session is back on the free route.
+          titles.onPrompt(String(event.sessionID));
         } catch (error) {
           logger.error("prompt hook failed", {
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }),
+    );
+
+    registrations.push(
+      await context.session.hook("title", async (event) => {
+        if (!config.enabled) return;
+        try {
+          const title = await titles.onTitle({
+            sessionID: String(event.sessionID),
+            model: asRef(event.model),
+          });
+          if (title !== undefined) event.result = title;
+        } catch (error) {
+          logger.error("title hook failed", {
+            requestKind: "title",
             detail: error instanceof Error ? error.message : String(error),
           });
         }
@@ -305,6 +400,7 @@ export default Plugin.define({
     registrations.push(
       await context.session.hook("model.request", async (event) => {
         if (!config.enabled) return;
+        if (event.kind === "generate" && titleGenerating.has(String(event.sessionID))) return;
         try {
           engine.onModelRequest(String(event.sessionID), asRef(event.model), event.kind);
         } catch (error) {
@@ -321,6 +417,7 @@ export default Plugin.define({
         async (event) => {
           if (!config.enabled) return;
           if (!modelIsPrimary(event.model)) return;
+          if (event.kind === "generate" && titleGenerating.has(String(event.sessionID))) return;
           try {
             engine.onHttpHeaders(String(event.sessionID), headersToRecord(event.response.headers));
             engine.onHttpResponse({
@@ -336,6 +433,30 @@ export default Plugin.define({
         },
         { providerID: config.primary.providerID },
       ),
+    );
+
+    // Unscoped: OpenCode swallows a failed native title request, so the only
+    // way to keep a paid-route conversation named is to observe the response and
+    // write the deterministic fallback through the supported session API. The
+    // handler is inert for every other request kind.
+    registrations.push(
+      await context.session.hook("http.response", async (event) => {
+        if (!config.enabled) return;
+        if (event.kind !== "title") return;
+        if (event.response.status < 400) return;
+        try {
+          await titles.onNativeFailure({
+            sessionID: String(event.sessionID),
+            model: asRef(event.model),
+            status: event.response.status,
+          });
+        } catch (error) {
+          logger.error("native title fallback hook failed", {
+            requestKind: "title",
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }),
     );
 
     // Unscoped on purpose: failover decisions belong to the free model, and the
@@ -411,6 +532,9 @@ export default Plugin.define({
             return;
           case "session.execution.succeeded":
             engine.onExecution({ sessionID, phase: "settled", outcome: "succeeded" });
+            // The turn settled on its real route; a first-prompt title written
+            // before it may now be replaced by a generated one.
+            titles.onSettled(sessionID);
             return;
           case "session.execution.failed":
             engine.onExecution({ sessionID, phase: "settled", outcome: "failed" });
@@ -472,6 +596,7 @@ export default Plugin.define({
     const rpc = await context.rpc.register(FREE_FIRST_RPC, {
       control: async (rawInput: unknown): Promise<FreeFirstRpcOutput> => {
         const output = await handleFreeFirstControl(engine, rawInput);
+        if (output.status !== undefined) output.status.titles = titles.stats();
         if (output.mode !== undefined) {
           // The engine already rebuilt this location's model defaults through
           // `onModeChanged`. Every location has its own plugin instance, so the

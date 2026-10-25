@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-first",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "OpenCode v2 plugin that prefers a free model, fails over and recovers around free-route availability problems, and can be switched between Free First, Peak Only, and disabled inside the TUI.",
   "author": "Lutz Kind",
   "license": "MIT",

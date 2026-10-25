@@ -101,14 +101,20 @@ stays in charge of *when* paid work runs.
    prepared compaction cannot change it on retry. A compaction that *discovers*
    a limit is still allowed to fail once: that request is the discovery. Idle
    sessions are left alone; prompt admission and request preparation route them.
-9. **Reclaims parked paid work without interrupting the session.** If another
+9. **Names the session even when the free tier refuses its own title request.**
+   OpenCode's automatic title request is tool-less, and the free tier can reject
+   that shape while the turn succeeds. On the free primary the plugin supplies the
+   normalized first prompt as the title immediately, then replaces it with one
+   generated title after the turn settles — on the free route only, never
+   overwriting a manual rename. Other models keep OpenCode's native title path.
+10. **Reclaims parked paid work without interrupting the session.** If another
    plugin holds the fallback request (for example an off-peak pricing policy) and
    the free model recovers first, the plugin cancels the obsolete paid attempt
    through the parking plugin's generic hold cancellation, and the same
    execution continues on the free model. The held request is refused at the
    transport boundary, so it is never sent, no continuation input is admitted,
    and a headless `opencode run` stays attached until the task finishes.
-10. **Respects explicit model choices.** A manual change to an unrelated model —
+11. **Respects explicit model choices.** A manual change to an unrelated model —
    or to the paid route — stops free-first from managing that session.
 
 ## What it does not do
@@ -132,7 +138,7 @@ OpenCode v2 accepts npm-compatible package specifications, including Git URLs
 and exact tags. Install the published release:
 
 ```sh
-opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.3.0
+opencode plugin add git+https://github.com/lutzkind/opencode-free-first.git#v0.4.0
 opencode plugin list
 ```
 
@@ -447,6 +453,7 @@ opencode api post /api/rpc/opencode-free-first/control --data '{"input":{"action
 | `managedSessions` / `fallbackSessions` | how many sessions are managed, and how many are on the fallback |
 | `manualOverrides` | sessions the user explicitly repointed |
 | `transitions` | the most recent model transitions, for switch-churn checks |
+| `titles` | `attempted`, `fallback` (first-prompt titles supplied), `generated` (fallbacks upgraded), `delegated` (native models), `skipped` (upgrade not eligible), `failed` |
 
 Other actions: `reset` clears a cooldown an operator knows is lifted; `on` and
 `off` are the runtime master switch (not a mode change); `set-mode` accepts
@@ -527,7 +534,7 @@ See [`docs/development.md`](docs/development.md) and
 
 `opencode-offpeak` is optional for `always-free-first`/`off` and required for
 `peak-only` at runtime. Verified coexistence: `opencode-offpeak` `v0.2.0` beside
-`opencode-free-first` `v0.3.0` on OpenCode `2.0.30` (server) and `2.1.3`
+`opencode-free-first` `v0.4.0` on OpenCode `2.0.30` (server) and `2.1.3`
 (server + TUI).
 
 ## License

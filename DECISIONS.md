@@ -473,3 +473,32 @@ real-CLI coexistence suite runs on 2.1.3.
 fallback because the session-previous heuristic cannot be priced ahead of time.
 An invalid mode is a visible configuration error that disables routing rather
 than guessing. This preserves existing users' behaviour until they opt in.
+
+## 036 — Free-route titles use a prompt fallback plus a settled upgrade
+
+OpenCode's automatic title request is tool-less, and the free tier refuses that
+shape even when the tool-bearing turn on the same model succeeds. The failure is
+swallowed in core, so no retry/failover hook can recover it, and a core patch or
+fork is out of scope for a plugin.
+
+The chosen seam is the supported `title` hook plus the supported
+`ctx.session.generate` call:
+
+1. The hook returns the bounded, normalized first user prompt on the free
+   primary. This costs no provider request, cannot race the turn or a failover,
+   and makes the session durably named as soon as the turn starts.
+2. After `session.execution.succeeded`, one tool-bearing `session.generate`
+   request on the same session replaces the fallback. This mirrors upstream PR
+   #57624 without a core patch. It is attempted only while the session is on the
+   free primary and the router would spend free quota, is capped at three
+   attempts, and re-checks the stored title immediately before renaming, so it
+   cannot create paid traffic or overwrite a manual rename.
+3. A native title failure on a non-free route is observed at `http.response` and
+   filled from the first prompt through `session.update`. Title failures never
+   feed the health/failover state.
+
+Alternatives rejected: `ctx.generate.text` (also tool-less; live 403), building a
+tool-bearing request through `http.request`/model-request rewrites (spoofing the
+request shape), a title daemon/service/scheduler, a permanent OpenCode fork, or
+writing the fallback as an empty title (OpenCode treats an empty stored title as
+titled and suppresses every later attempt).

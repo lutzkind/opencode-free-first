@@ -1524,6 +1524,18 @@ export class FreeFirstEngine {
     return this.#inCooldown() || this.#pricingBlocksFree();
   }
 
+  /**
+   * True when the router itself would spend a free request right now.
+   *
+   * The title compatibility shim uses this single answer instead of keeping a
+   * second routing opinion: a live cooldown, a closed price gate, the disabled
+   * master switch, and `freeUsageMode: "off"` all close it. Title requests are
+   * never allowed to manufacture availability.
+   */
+  freeRouteSpendable(): boolean {
+    return this.#active() && !this.#mustUseFallback();
+  }
+
   #stateFor(sessionID: string): SessionState {
     let state = this.#sessionsState.get(sessionID);
     if (state === undefined) {

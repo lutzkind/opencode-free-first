@@ -40,6 +40,21 @@ function defaults() {
      */
     onlyWithTools: false,
     /**
+     * Apply the error `mode` only to requests *without* tools. This is the live
+     * OpenCode free-tier behaviour from anomalyco/opencode#58176: the normal
+     * tool-bearing agent request is served, while the tool-less automatic title
+     * request is refused with `403 FreeTierError`.
+     */
+    toolLessOnly: false,
+    /**
+     * Keep the title compatibility shim's replacement request out of request
+     * counters, error modes, and the `request` log. Legacy failover cases use
+     * this so a scenario's deliberate free-route failure is discovered by the
+     * agent-loop request, exactly as before the shim existed. Title cases set
+     * it to false to observe the replacement request directly.
+     */
+    ignoreTitleReplacement: false,
+    /**
      * Prompt tokens reported on this role's responses. OpenCode treats the last
      * response's usage as the measured prompt size, so a large value is how a
      * scenario makes an automatic compaction due without generating a huge
@@ -65,6 +80,8 @@ const served = { free: 0, paid: 0 };
 const state = {
   free: defaults(),
   paid: defaults(),
+  /** Fail every title-shim replacement request, on any route, with 403. */
+  failTitleReplacement: false,
   log: [],
   /** The probe prompt the harness configures, so the gate is unambiguous. */
   probeMarker: process.env.FF_MOCK_PROBE_MARKER ?? "FF_PROBE_PROBE_ONLY",
@@ -144,7 +161,12 @@ function stream(response, model, options = {}) {
     connection: "keep-alive",
   });
   const base = { id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created, model };
-  const text = options.compaction === true ? COMPACTION_SUMMARY : `MOCK_OK model=${model}`;
+  const text =
+    options.compaction === true
+      ? COMPACTION_SUMMARY
+      : options.titleReplacement === true
+        ? "Deploy pipeline repair"
+        : `MOCK_OK model=${model}`;
   const halves = [
     text.slice(0, Math.ceil(text.length / 2)),
     text.slice(Math.ceil(text.length / 2)),
@@ -198,6 +220,8 @@ const server = http.createServer(async (request, response) => {
   if (request.url?.startsWith("/__control")) {
     const patch = JSON.parse(raw || "{}");
     if (Array.isArray(patch.log)) state.log = patch.log;
+    if (typeof patch.failTitleReplacement === "boolean")
+      state.failTitleReplacement = patch.failTitleReplacement;
     for (const role of ["free", "paid"]) {
       if (patch[role]) state[role] = { ...state[role], ...patch[role] };
       if (patch.resetCounters === true) served[role] = 0;
@@ -226,22 +250,58 @@ const server = http.createServer(async (request, response) => {
   const role = roleOf(raw);
   const config = state[role];
   const tooled = Array.isArray(parsed.tools) && parsed.tools.length > 0;
-  const eligible = config.onlyWithTools !== true || tooled;
+  const model = String(parsed.model ?? "");
+  const compaction = isCompaction(raw);
+  // The title compatibility shim's own instruction, so a test can tell its
+  // tool-bearing replacement request apart from OpenCode's native title request.
+  const titleReplacement = raw.includes("Write a concise title");
+  const ignored = config.ignoreTitleReplacement === true && titleReplacement;
+  const eligible =
+    !ignored &&
+    (config.onlyWithTools !== true || tooled) &&
+    (config.toolLessOnly !== true || !tooled);
   if (eligible) served[role] += 1;
   const limit = config.failFirst ?? Number.POSITIVE_INFINITY;
   const failing = config.mode !== "ok" && eligible && served[role] <= limit;
   const effective = failing ? config.mode : "ok";
-  const model = String(parsed.model ?? "");
-  const compaction = isCompaction(raw);
-  state.log.push({
-    event: "request",
-    model,
-    role,
-    compaction,
-    stream: parsed.stream === true,
-    messages: Array.isArray(parsed.messages) ? parsed.messages.length : undefined,
-    tools: Array.isArray(parsed.tools) ? parsed.tools.length : undefined,
-  });
+  if (ignored) {
+    state.log.push({
+      event: "title-replacement",
+      model,
+      role,
+      tools: Array.isArray(parsed.tools) ? parsed.tools.length : undefined,
+    });
+  } else {
+    state.log.push({
+      event: "request",
+      model,
+      role,
+      compaction,
+      ...(titleReplacement ? { titleReplacement: true } : {}),
+      stream: parsed.stream === true,
+      messages: Array.isArray(parsed.messages) ? parsed.messages.length : undefined,
+      tools: Array.isArray(parsed.tools) ? parsed.tools.length : undefined,
+    });
+  }
+
+  if (state.failTitleReplacement === true && titleReplacement) {
+    state.log.push({
+      event: "error-response",
+      model,
+      status: 403,
+      message: "mock title generation failure",
+      compaction,
+      titleReplacement: true,
+    });
+    sendJson(response, 403, {
+      error: {
+        message: "mock title generation failure",
+        type: "mock_error",
+        code: "mock_error",
+      },
+    });
+    return;
+  }
 
   if (config.delayMs) await new Promise((resolve) => setTimeout(resolve, config.delayMs));
 
@@ -296,6 +356,7 @@ const server = http.createServer(async (request, response) => {
   if (parsed.stream === true) {
     stream(response, model, {
       compaction,
+      titleReplacement,
       promptTokens: config.promptTokens,
     });
     return;
@@ -310,7 +371,11 @@ const server = http.createServer(async (request, response) => {
         index: 0,
         message: {
           role: "assistant",
-          content: compaction ? COMPACTION_SUMMARY : `MOCK_OK model=${model}`,
+          content: compaction
+            ? COMPACTION_SUMMARY
+            : titleReplacement
+              ? "Deploy pipeline repair"
+              : `MOCK_OK model=${model}`,
         },
         finish_reason: "stop",
       },
